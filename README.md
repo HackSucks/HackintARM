@@ -4,6 +4,15 @@ an attempt at reviving Hackintosh in the form of ARM64 laptops, given Apple's sw
 # Currently working:
 Patched XNU Kernel execution under QEMU virt machine with compiled ADT
 
+Till now what is working: 
+
+using bootloader to make 16KB page tables and pivot into XNU kernel code
+
+XNU setting up its own MMU and proceeding execution in it's own Virtual Memory
+
+# Bug Right Now:
+XNU failing to parse boot-args from unmapped 0xfffffbffcaf86090
+
 # NOT Working/Roadmap
 ~~Kernel mapping to MMU~~
 
