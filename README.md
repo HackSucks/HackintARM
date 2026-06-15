@@ -5,7 +5,7 @@ an attempt at reviving Hackintosh in the form of ARM64 laptops, given Apple's sw
 Patched XNU Kernel execution under QEMU virt machine with compiled ADT
 
 # NOT Working/Roadmap
-Kernel mapping to MMU
+~~Kernel mapping to MMU~~
 
 other kernel patches...
 
