@@ -5,15 +5,15 @@ an attempt at reviving Hackintosh in the form of ARM64 laptops, given Apple's sw
 Patched XNU Kernel execution under QEMU virt machine with compiled ADT
 
 # NOT Working/Roadmap
-Kernel napping to MMU
+Kernel mapping to MMU
 
 other kernel patches...
 
 Hypervisor for 16K memory map --> 4K map most commonly seen on ARM SoC
 
-Same Hypervisor for AGX GPU --> Actual GPU to see diaplay
+Same Hypervisor for AGX GPU --> Actual GPU to see display
 
-Currently support is only for QEMU virt machine, despite ARM SoC having similarities there will be efforts to make the project work on various other ARM laptops and devices once macOS can boot under QEMU more or less functional.
+Currently support is only for QEMU virt machine, despite All ARM SoC having similarities there will be efforts to make the project work on various other ARM laptops and devices once macOS can boot under QEMU more or less functional.
 
 # How does it work?
 Soon.
