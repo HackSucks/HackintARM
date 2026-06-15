@@ -16,7 +16,7 @@ XNU failing to parse boot-args from unmapped 0xfffffbffcaf86090
 # NOT Working/Roadmap
 ~~Kernel mapping to MMU~~
 
-other kernel patches...
+~~other kernel patches...~~
 
 Hypervisor for 16K memory map --> 4K map most commonly seen on ARM SoC
 
