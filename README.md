@@ -12,6 +12,8 @@ XNU setting up its own MMU and proceeding execution in it's own Virtual Memory
 
 XNU reaching arm_init
 
+XNU parsing boot_args, the beginning of true XNU boot
+
 # Bug Right Now:
 in a bit
 
