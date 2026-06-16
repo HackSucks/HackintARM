@@ -10,8 +10,10 @@ using bootloader to make 16KB page tables and pivot into XNU kernel code
 
 XNU setting up its own MMU and proceeding execution in it's own Virtual Memory
 
+XNU reaching arm_init
+
 # Bug Right Now:
-XNU failing to parse boot-args from unmapped 0xfffffbffcaf86090
+in a bit
 
 # NOT Working/Roadmap
 ~~Kernel mapping to MMU~~
