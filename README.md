@@ -1,6 +1,10 @@
 # HackintARM
 an attempt at reviving Hackintosh in the form of ARM64 laptops, given Apple's switch to purely Apple Sillicon for macOS 27
 
+# NOTICE
+
+Currently im taking a break, ive been working non-stop on this for 4 days and want to focus my brain somewhere else. ive decided to return to working on this specific project in 4 days.
+
 # Currently working:
 Patched XNU Kernel execution under QEMU virt machine with compiled ADT
 
