@@ -2,42 +2,17 @@
 an attempt at reviving Hackintosh in the form of ARM64 laptops, given Apple's switch to purely Apple Sillicon for macOS 27
 
 # NOTICE
+I restarted from scratch. Attempt 1 ended around 3 months ago, after i completely burned out :<.
+This is attempt 2.
+Yhis time, with new knowledge, i aim to get at the least UART working sooner.
 
-Currently im taking a break, ive been working non-stop on this for 4 days and want to focus my brain somewhere else. ive decided to return to working on this specific project in 4 days.
+This time it will be 2 parts, HackintARM as the project, Gatehouse being the name of the EFI applicatiom/bootloader that runs. this means it works on anything that has UEFI, and no more bare-metal bring up is needed. 
 
-# Currently working:
-Patched XNU Kernel execution under QEMU virt machine with compiled ADT
-
-Till now what is working: 
-
-using bootloader to make 16KB page tables and pivot into XNU kernel code
-
-XNU setting up its own MMU and proceeding execution in it's own Virtual Memory
-
-XNU reaching arm_init
-
-XNU parsing boot_args, the beginning of true XNU boot
-
-# Bug Right Now:
-in a bit
-
-# NOT Working/Roadmap
-~~Kernel mapping to MMU~~
-
-~~other kernel patches...~~
-
-Hypervisor for 16K memory map --> 4K map most commonly seen on ARM SoC
-
-Same Hypervisor for AGX GPU --> Actual GPU to see display
-
-Currently support is only for QEMU virt machine, despite All ARM SoC having similarities there will be efforts to make the project work on various other ARM laptops and devices once macOS can boot under QEMU more or less functional.
-
-# How does it work?
-Soon.
+# Source?
+Soon, as soon as UART works.
 
 # ETA?
-Also, Soon.
+Being optimistic, maybe 2 weeks for UART.
 
-# Source Code?
-
-When the project more or less is functional.
+# Target?
+macOS 27, using the vmapple kernelcache, as it does not have as many platform assumptions. 
