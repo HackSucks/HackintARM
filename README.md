@@ -16,3 +16,6 @@ Being optimistic, maybe 2 weeks for UART.
 
 # Target?
 macOS 27, using the vmapple kernelcache, as it does not have as many platform assumptions. 
+
+# Requirements?
+a ARMv8 SoC that provides pauth. any SoC without this is imcompatible with HackintARM for now.
