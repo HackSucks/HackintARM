@@ -53,6 +53,13 @@ kexts are GPL-3.0-or-later and combine with the core under GPLv3 terms. Linux
 ## Status
 
 Gatehouse boot support for the `MH_FILESET` kernel collection works: the kernel
-slides, initialises its prelinked kexts and registers its IOKit personalities.
-Bring-up is currently pushing through early platform init (the ADT nodes
-AppleImage4 and the platform "mpo" policy require).
+slides, initialises its prelinked kexts and registers its IOKit personalities
+(1122 personalities sent to the IOCatalogue).
+
+The ADT now provides the machine-identity and boot-manifest nodes that
+AppleImage4 and the platform "mpo" policy require (`/product`, `/options`,
+`/defaults`, `/chosen{,/manifest-properties,/asmb}`), copied from the authentic
+VMApple ADT. Bring-up now reaches early IOKit service bring-up; the current
+wall is NVRAM (`IONVRAMCHRPHandler creation failed`) — on real vmapple the
+NVRAM is a virtio device (`AppleVirtIONVRAM`), so this is a device-emulation
+task that belongs to Trestle.
