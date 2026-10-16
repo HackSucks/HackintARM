@@ -471,7 +471,15 @@ def build():
         "device-tree",
         ("model", s("Gatehouse virtual platform")),
         ("target-type", s("vmapple")),
-        ("compatible", s("Apple,vmapple")),
+        # AppleVirtualPlatformARMPE (com.apple.driver.AppleVirtualPlatform)
+        # matches its provider with IONameMatch = "AppleVirtualPlatformARM",
+        # and IODTCompareNubName tests the node's compatible as well as its
+        # name.  The platform nub is named from compatible[0]; a machine with
+        # no matching platform expert ends up in IOPanicPlatform and panics
+        # with that name ("Unable to find driver for this platform").
+        ("compatible", s("AppleVirtualPlatformARM")
+         + s("VMA2MACOSAP")
+         + s("VirtualMac2,1")),
         ("#address-cells", u32(2)),
         ("#size-cells", u32(2)),
         children=[chosen, defaults, product, options, arm_io, cpus, pram],
