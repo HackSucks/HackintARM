@@ -18,7 +18,7 @@ panic: failed to get manifest properties
 and, once those exist, the next layer down asks for platform devices:
 
 ```
-panic(cpu 0 caller ...): IONVRAMCHRPHandler creation failed @IONVRAM.cpp:1691
+panic(cpu 0 caller ...): IONVRAMV3Handler creation failed @IONVRAM.cpp:1688
 ```
 
 Those names, nodes and services are the **Apple virtual platform**: the contract
@@ -87,42 +87,72 @@ the wall the bring-up hit.
 
 ### The contract
 
-From Apple's open-source `iokit/Kernel/IONVRAM.cpp`:
+The modern kernel does not link `IONVRAMCHRPHandler` from the old open-source
+`IONVRAM.cpp`; the classes moved into XNU. Reversing the factory in the shipping
+kernel collection gives the real contract. It reads `/chosen` and picks a
+handler from the *contents* of the store:
 
-* `initProxyData()` reads the `/chosen` property **`nvram-proxy-data`** — the
-  whole NVRAM store as one image — into the handler's buffer.
-* `getNVRAMSize()` reads the `/chosen` property **`nvram-total-size`**.
-* `initNVRAMImage()` walks the image as a sequence of CHRP partitions and
-  remembers the `system` and `common` partitions. A store with a `common`
-  partition is the minimum required.
+```
+entry = IORegistryEntry::fromPath("/chosen")
+bank  = entry->getProperty("nvram-bank-size")
+image = entry->getProperty("nvram-proxy-data")
 
-The modern (lockdown) handler, `IONVRAMCHRPHandler`, takes the same image and
-adds a small authenticated header; the failure in the bring-up is that the image
-was never provided at all.
+if (image[0..3] == 0x4e565633 && image[0xe] == 1 && bank >= 0x18)
+        IONVRAMV3Handler::create(this, image, bank)     // with the image
+else
+        IONVRAMCHRPHandler::create(this, NULL, bank)    // with *no* image
+```
+
+The CHRP branch is the trap. It builds a handler over a `NULL` image, so the
+partition offsets stay at their `-1` sentinel and the first access faults. It is
+not a fallback that can be satisfied by device-tree data; the store must be a V3
+image.
+
+`IONVRAMV3Handler::create()` then calls `init()`, which requires, on `/chosen`:
+
+| property | type | meaning |
+|----------|------|---------|
+| `nvram-bank-size` | OSData(u32) | bank size; also the image size `create()` is called with |
+| `nvram-bank-count` | OSData(u32) | number of banks |
+| `nvram-current-bank` | OSData(u32) | active bank |
+| `nvram-raw` | OSData(u32) | non-zero selects raw interpretation of the store |
+| `nvram-proxy-data` | OSData | the V3 image |
+
+`init()` fails silently (returns false) if any of these is missing, and the
+factory reports `IONVRAMV3Handler creation failed @IONVRAM.cpp:1688`. The
+`nvram-raw` property is the easy one to miss: it is a plain flag but `init()`
+still requires it to be present.
 
 ### The image format
 
+`IONVRAMV3Handler` parses the store through a 0x18-byte header and requires
+`size >= 0x18` and `header.size == size`:
+
 ```
-struct chrp_nvram_header {          // 16 bytes, 16-byte aligned
-    u8   sig;                       // 0x70 = system, 0x71 = config
-    u8   cksum;                     // the 16 header bytes sum to zero (mod 256)
-    u16  len;                       // partition length in 16-byte blocks
-    char name[12];                  // "system" / "common" ("2system"/"2common")
+struct nvram_v3_header {            // 0x18 bytes
+    u32 magic;                      // 0x4e565633
+    u32 size;                       // total image size
+    u32 region_offset;              // -> handler field 0x30
+    u8  reserved[2];                // 0x0c, 0x0d
+    u8  version;                    // 0x0e == 1
+    u8  reserved2;
+    u32 field_10;                   // -> handler field 0x4c
+    u32 data_end;                   // -> handler field 0x48 (minus 0x18)
 };
 ```
 
-The image is a run of these, each followed by its data area, packed until the
-store is full. `src/nvram.c` builds an empty (factory) image: a `system` and a
-`common` partition, both zeroed — a zeroed variable area deserialises to the
-default dictionary.
+An empty (factory) image is a zeroed buffer with just this header. `src/nvram.c`
+builds it; the older CHRP-partition image the code used to build is what a raw
+store looks like and is selected by `nvram-raw`, but the bring-up needs the
+structured image.
 
 ### Who writes it
 
-On a real machine, iBoot writes the live image into `/chosen` before starting
-the kernel. That is exactly Trestle's job here. The model owns the image; the
-device tree builder publishes it as `/chosen`'s `nvram-proxy-data` and
-`nvram-total-size`. `tests/nvram_test.c` asserts the produced image has that
-shape.
+On a real machine, iBoot writes the live image and the geometry into `/chosen`
+before starting the kernel. That is exactly Trestle's job here. The model owns
+the image; the device tree builder publishes it as `/chosen`'s
+`nvram-proxy-data` and `nvram-total-size`/`nvram-bank-*`/`nvram-raw`.
+`tests/nvram_test.c` asserts the produced image has the shape above.
 
 ## 5. Device tree ownership
 
@@ -161,7 +191,8 @@ bring-up decision, not a design one: the device models are the same either way.
 
 ## 8. Roadmap
 
-1. **NVRAM** — done (model + image + tests); unblocks `IONVRAMCHRPHandler`.
+1. **NVRAM** — model + V3 image + the full `/chosen` contract (`nvram-bank-*`,
+   `nvram-raw`, `nvram-proxy-data`) + tests; unblocks `IONVRAMV3Handler`.
 2. **Device tree builder** — move ADT construction into Trestle; make devices
    contribute their own nodes.
 3. **The rest of the early platform** — the devices the next failures ask for

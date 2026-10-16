@@ -3,72 +3,97 @@
 //
 // trestle/include/nvram.h - the NVRAM device model.
 //
-// XNU reaches non-volatile storage through IONVRAMCHRPHandler, which takes the
-// store from the device tree: the /chosen property "nvram-proxy-data" is an
-// image of 16-byte-aligned CHRP partitions and "nvram-total-size" is its size.
-// The layout is defined by Apple's open-source iokit/Kernel/IONVRAM.cpp:
+// XNU 27 reaches non-volatile storage through IONVRAM.  Its factory
+// (iokit/Kernel/IONVRAM.cpp) looks the store up in the device tree and picks a
+// handler from the first bytes of the image store:
 //
-//     struct chrp_nvram_header {              // 16 bytes
-//         u8  sig;                            // 0x70 system, 0x71 config
-//         u8  cksum;                          // header bytes sum to zero
-//         u16 len;                            // length in 16-byte blocks
-//         char name[12];                      // "system" / "common"
+//     entry = IORegistryEntry::fromPath("/chosen")
+//     bank  = entry->getProperty("nvram-bank-size")     // also a size
+//     image = entry->getProperty("nvram-proxy-data")
+//
+//     if (image[0..3] == 0x4e565633 && image[0xe] == 1 && bank >= 0x18)
+//         IONVRAMV3Handler::create(this, image, bank)   // with the image
+//     else
+//         IONVRAMCHRPHandler::create(this, NULL, bank)  // with *no* image
+//
+// The CHRP branch builds an uninitialised handler that faults on first use, so
+// the store must be a V3 image.  That format is a 0x18-byte header followed by
+// the variable data:
+//
+//     struct nvram_v3_header {                // 0x18 bytes
+//         uint32_t magic;                     // 0x4e565633
+//         uint32_t size;                      // total image size
+//         uint32_t region_offset;             // -> handler field 0x30
+//         uint8_t  reserved[2];               // 0x0c, 0x0d
+//         uint8_t  version;                   // 0x0e == 1
+//         uint8_t  reserved2;
+//         uint32_t field_10;                  // -> handler field 0x4c
+//         uint32_t data_end;                  // -> handler field 0x48 (minus 0x18)
 //     };
 //
-// This device owns that image and answers reads and writes to it.  It is the
-// first Trestle device because it is small, self-contained and on the boot
-// critical path.
+// This device owns that image.  It is the first Trestle device because it is
+// small, self-contained and on the boot critical path.
+//
+// The factory and the handler's init() read these /chosen properties:
+//
+//     nvram-bank-size     u32   bank size in bytes; also the image size that
+//                               IONVRAMV3Handler::create() is called with
+//     nvram-bank-count    u32   number of banks
+//     nvram-current-bank  u32   active bank
+//     nvram-raw           u32   non-zero selects raw interpretation of the
+//                               store; must be present or init() fails
+//     nvram-proxy-data    data  the V3 image itself
+//     nvram-total-size    u32   total store size (bank-size * bank-count)
 #ifndef TRESTLE_NVRAM_H
 #define TRESTLE_NVRAM_H
 
 #include "trestle.h"
 
-#define NVRAM_CHRP_SIG_SYSTEM   0x70
-#define NVRAM_CHRP_SIG_CONFIG   0x71
-#define NVRAM_CHRP_BLOCK        0x10            // len is in 16-byte blocks
-#define NVRAM_CHRP_NAME_LEN     12
+#define NVRAM_V3_MAGIC         0x4E565633u
+#define NVRAM_V3_VERSION       1u
+#define NVRAM_V3_HEADER_SIZE   0x18
 
-#define NVRAM_DEFAULT_SIZE      8192            // what iBoot uses on Apple e
-#define NVRAM_MAX_SIZE          (64 * 1024)
+#define NVRAM_DEFAULT_SIZE     8192            // what iBoot uses on Apple Silicon
+#define NVRAM_MAX_SIZE         (64 * 1024)
 
 typedef struct {
-    u8  sig;
-    u8  cksum;
-    u16 len;                                    // in NVRAM_CHRP_BLOCK units
-    char name[NVRAM_CHRP_NAME_LEN];
-} __attribute__((packed)) nvram_chrp_header;
+    u32 magic;
+    u32 size;
+    u32 region_offset;
+    u8  reserved_c;
+    u8  reserved_d;
+    u8  version;
+    u8  reserved_f;
+    u32 field_10;
+    u32 data_end;
+} __attribute__((packed)) nvram_v3_header;
 
 typedef struct trestle_nvram {
-    trestle_device device;                      // must be first: the vtable
+    trestle_device   device;                    // must be first: the vtable
 
-    u8      *image;                             // CHRP image, `size` bytes
-    usize    size;
-    u64      generation;
-    int      dirty;
+    u8              *image;                     // V3 image, `size` bytes
+    usize            size;
+    nvram_v3_header *header;
 
-    u32      system_partition_offset;
-    u32      system_partition_size;
-    u32      common_partition_offset;
-    u32      common_partition_size;
+    u64              generation;
+    int              dirty;
+    int              raw;                       // /chosen "nvram-raw"
 } trestle_nvram;
 
-// Initialise `nv` to back a `size`-byte store held in `storage`.  Builds an
-// empty but well-formed image (a "system" and a "common" partition).  Passing
-// size == 0 selects NVRAM_DEFAULT_SIZE.
+// Format `storage` (a `size`-byte buffer) as an empty but well-formed V3
+// image.  size == 0 selects NVRAM_DEFAULT_SIZE.  Returns the header written.
+nvram_v3_header *trestle_nvram_format(u8 *storage, usize size);
+
+// Initialise `nv` to back the `size`-byte store in `storage`, formatting it if
+// it does not already hold a valid V3 image.  size == 0 selects the default.
 trestle_status trestle_nvram_init(trestle_nvram *nv, u8 *storage, usize size);
 
-// Encode one CHRP partition (header + `data` bytes, zero-padded to a block)
-// into `out`, which must hold at least nvram_chrp_partition_size() bytes.
-// Returns the number of bytes written, or 0 on error.
-usize trestle_nvram_chrp_partition(u8 *out, usize out_size, u8 sig,
-                                   const char *name, const void *data,
-                                   usize data_size);
-usize trestle_nvram_chrp_partition_size(usize data_size);
+// True when `image` starts with a valid V3 header for `size` bytes.
+int trestle_nvram_is_valid(const u8 *image, usize size);
 
-// Walk the image and record the system/common partition geometry.
-trestle_status trestle_nvram_parse(trestle_nvram *nv);
-
-// Device-model entry points (used when it is registered as a trestle_device).
+// Device-model entry point.  When Trestle owns the device tree this publishes
+// the image on /chosen as "nvram-total-size"/"nvram-bank-size" and
+// "nvram-proxy-data"; today Gatehouse's dt/build_adt.py mirrors it.
 trestle_status trestle_nvram_contribute(trestle_device *dev, void *node);
 
 #endif // TRESTLE_NVRAM_H

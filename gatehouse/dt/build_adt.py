@@ -189,47 +189,63 @@ def reserved_manifest_properties():
 # ---------------------------------------------------------------------------
 # NVRAM.
 #
-# XNU's NVRAM path for this platform is IONVRAMCHRPHandler (see the CHRP
-# NVRAM constants in iokit/Kernel/IONVRAM.cpp).  It reads the image size from
-# the /chosen "nvram-total-size" property and the image itself from
-# "nvram-proxy-data" (initProxyData()/getNVRAMSize()/initNVRAMImage()):
+# XNU's NVRAM store lives in the /chosen property "nvram-proxy-data" with its
+# size in "nvram-total-size", and the factory in iokit/Kernel/IONVRAM.cpp
+# (XNU 27) inspects the first bytes to pick a handler:
 #
-#     struct chrp_nvram_header {          // 16 bytes, 16-byte aligned
-#         uint8_t  sig;                   // 0x70 = system, 0x71 = config
-#         uint8_t  cksum;                 // sum of the 16 header bytes == 0
-#         uint16_t len;                   // partition length in 16-byte blocks
-#         char     name[12];              // "system" / "common"
+#     ldr  w8,  [data]         ; first four bytes
+#     cmp  w8,  #0x4e565633    ; store magic
+#     ldrb w8,  [data, 0xe]
+#     cmp  w8,  #1             ; format version
+#
+# A match builds IONVRAMV3Handler::create(owner, data, size) *with* the image;
+# anything else builds IONVRAMCHRPHandler::create(owner, NULL, size) with no
+# image at all, which leaves the handler uninitialised and faults later.  The
+# store therefore has to be a V3 image.
+#
+# IONVRAMV3Handler::init() in turn requires these /chosen properties, all as
+# 4-byte OSData, and fails silently (line 1688) if any is missing:
+#
+#     nvram-bank-size, nvram-bank-count, nvram-current-bank, nvram-raw
+#
+# "nvram-raw" is a flag: [handler 0x2c] = (value != 0).  "nvram-bank-size" is
+# also the size that create() is handed.
+#
+# The V3 parser (IONVRAMV3Handler, reached from create) reads a 0x18-byte
+# header and requires size >= 0x18, header[4] == size and header[0xe] == 1:
+#
+#     struct nvram_v3_header {            // 0x18 bytes
+#         uint32_t magic;                 // 0x4e565633
+#         uint32_t size;                  // total image size
+#         uint32_t region_offset;         // -> handler field 0x30
+#         uint8_t  reserved[2];           // 0x0c, 0x0d
+#         uint8_t  version;               // 0x0e == 1
+#         uint8_t  reserved2;
+#         uint32_t field_10;              // -> handler field 0x4c
+#         uint32_t data_end;              // -> handler field 0x48 (data_end - 0x18)
 #     };
 #
-# On a real machine iBoot writes the live image here.  Producing it is the
-# job of the platform NVRAM device model (Trestle; see trestle/src/nvram.c).
-# This is the bring-up stand-in: an empty but well-formed image with a
-# "system" and a "common" partition, both zeroed (a zeroed variable area
-# deserialises to an empty dictionary, i.e. factory defaults).
+# On a real machine iBoot writes the live image here.  Producing it is the job
+# of the platform NVRAM device model (Trestle; see trestle/src/nvram.c); this
+# is the bring-up stand-in: an empty but well-formed V3 image.
 # ---------------------------------------------------------------------------
-NVRAM_SIZE = 8192               # the size iBoot uses on Apple Silicon
-NVRAM_SYSTEM_SIZE = 1024        # bytes, multiple of 16
-NVRAM_COMMON_SIZE = NVRAM_SIZE - NVRAM_SYSTEM_SIZE
+NVRAM_SIZE = 8192               # the store size iBoot uses on Apple Silicon
+NVRAM_V3_MAGIC = 0x4E565633
 
 
-def chrp_partition(sig, name, size):
-    """One CHRP NVRAM partition: 16-byte header + zeroed data area."""
-    total = ((size + 15) // 16) * 16            # data area, 16-byte aligned
-    header = bytearray(16)
-    header[0] = sig
-    header[2] = (total // 16) & 0xFF            # len, in 16-byte blocks
-    header[3] = ((total // 16) >> 8) & 0xFF
-    encoded = name.encode("ascii")
-    header[4:4 + len(encoded)] = encoded
-    header[1] = (-sum(header)) & 0xFF           # cksum: header sums to zero
-    return bytes(header) + bytes(total - 16)
+def _u32(value):
+    return value.to_bytes(4, "little")
 
 
-def nvram_proxy_data():
-    image = (chrp_partition(0x70, "system", NVRAM_SYSTEM_SIZE) +
-             chrp_partition(0x71, "common", NVRAM_COMMON_SIZE))
-    assert len(image) == NVRAM_SIZE, len(image)
-    return image
+def nvram_proxy_data(size=NVRAM_SIZE):
+    image = bytearray(size)
+    image[0x00:0x04] = _u32(NVRAM_V3_MAGIC)
+    image[0x04:0x08] = _u32(size)               # total image size
+    image[0x08:0x0C] = _u32(0)                  # region offset
+    image[0x0E] = 1                             # format version
+    image[0x10:0x14] = _u32(0)
+    image[0x14:0x18] = _u32(size)               # end of data
+    return bytes(image)
 
 
 # ---------------------------------------------------------------------------
@@ -349,9 +365,18 @@ def build():
         ("kernel-ctrr-to-be-enabled", u32(0)),
         # check_for_panic_log() reads the size of the panic log from here.
         ("embedded-panic-log-size", u32(PANIC_SIZE)),
-        # IONVRAMCHRPHandler: size and image of the NVRAM store.
+        # The NVRAM store.  The factory reads nvram-bank-size and passes it to
+        # IONVRAMV3Handler::create() as the image size, so the bank geometry,
+        # nvram-total-size and the image size all have to agree.
         ("nvram-total-size", u32(NVRAM_SIZE)),
         ("nvram-proxy-data", nvram_proxy_data()),
+        ("nvram-bank-size", u32(NVRAM_SIZE)),
+        ("nvram-bank-count", u32(1)),
+        ("nvram-current-bank", u32(0)),
+        # IONVRAMV3Handler::init() also requires "nvram-raw": it must be an
+        # OSData, and its first word selects raw vs. structured interpretation
+        # of the store ([obj+0x2c] = value != 0).  iBoot provides it.
+        ("nvram-raw", u32(0)),
         children=[memory_map, manifest_props, asmb],
     )
 
