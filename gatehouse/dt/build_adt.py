@@ -377,6 +377,22 @@ def build():
         # OSData, and its first word selects raw vs. structured interpretation
         # of the store ([obj+0x2c] = value != 0).  iBoot provides it.
         ("nvram-raw", u32(0)),
+        # Chip / secure-boot identity, copied from the authentic /chosen.
+        # AppleImage4 reads "crypto-hash-method" and maps "sha1"/"sha2-384"; if
+        # the property is absent the value is empty and it panics with
+        # "non-sensical crypto hash method".  The rest is the set a real iBoot
+        # publishes on the VMApple platform (and what AppleImage4 consumes).
+        ("crypto-hash-method", s("sha2-384")),
+        ("unique-chip-id", u64(0)),
+        ("secure-boot", u32(0)),
+        ("chip-id", u32(0)),
+        ("boot-nonce", u64(0)),
+        ("die-id", u64(0)),
+        ("unique-device-id", bytes(16)),
+        ("gid-aes-key", u32(0)),
+        ("uid-aes-key", u32(0)),
+        ("image4-supported", b""),
+        ("allow-ap-nonce-retrieval", b""),
         children=[memory_map, manifest_props, asmb],
     )
 
