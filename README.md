@@ -52,14 +52,30 @@ kexts are GPL-3.0-or-later and combine with the core under GPLv3 terms. Linux
 
 ## Status
 
-Gatehouse boot support for the `MH_FILESET` kernel collection works: the kernel
-slides, initialises its prelinked kexts and registers its IOKit personalities
-(1122 personalities sent to the IOCatalogue).
+Gatehouse boots the `MH_FILESET` kernel collection: the kernel slides,
+initialises its prelinked kexts and registers its IOKit personalities.
 
-The ADT now provides the machine-identity and boot-manifest nodes that
-AppleImage4 and the platform "mpo" policy require (`/product`, `/options`,
-`/defaults`, `/chosen{,/manifest-properties,/asmb}`), copied from the authentic
-VMApple ADT. Bring-up now reaches early IOKit service bring-up; the current
-wall is NVRAM (`IONVRAMCHRPHandler creation failed`) — on real vmapple the
-NVRAM is a virtio device (`AppleVirtIONVRAM`), so this is a device-emulation
-task that belongs to Trestle.
+The ADT supplies the machine identity, boot-manifest and chip/secure-boot nodes
+the early kernel requires (`/product`, `/options`, `/defaults`, `/chosen` with
+`manifest-properties`/`asmb`, the `crypto-hash-method` set, and the NVRAM
+image), taken from the authentic VMApple ADT.
+
+Walls cleared so far:
+
+* **ADT machine identity** — byte-faithful `/product`, `/options`, `/defaults`,
+  `/chosen/manifest-properties`, `/chosen/asmb`.
+* **NVRAM** — the kernel picks its handler from the store's contents, so it
+  needs a **V3 image** on `/chosen` (`nvram-proxy-data`) plus the geometry and
+  `nvram-raw` flag, not the CHRP partitions the open-source driver documents.
+* **Image4 crypto** — AppleImage4 reads `/chosen` `crypto-hash-method`
+  (`"sha2-384"`).
+* **Platform expert** — the root nub is named from the device tree root's
+  `compatible`; it must publish `AppleVirtualPlatformARM` so
+  `AppleVirtualPlatformARMPE` matches.
+
+Bring-up now loads the full kext set (`AppleARMPlatform`,
+`AppleVirtualPlatform`, `AppleVirtIO*`, `IOTimeSyncFamily`, `IOgPTPPlugin`, …)
+with **no panic** and runs on into late service startup. It stops there because
+the only disk attached is the EFI partition — there is no macOS system volume to
+mount, and on real vmapple the remaining platform devices (NVRAM, timers, GIC
+routing) are virtio/AAPL devices that Trestle is meant to emulate.
