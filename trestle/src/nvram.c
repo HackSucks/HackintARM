@@ -4,6 +4,8 @@
 // trestle/src/nvram.c - the NVRAM device model (see include/nvram.h).
 #include "nvram.h"
 
+#include "adt.h"
+
 // ---------------------------------------------------------------------------
 // Minimal freestanding helpers.  Trestle does not link a C library.
 // ---------------------------------------------------------------------------
@@ -90,32 +92,50 @@ trestle_status trestle_nvram_init(trestle_nvram *nv, u8 *storage, usize size)
         }
     }
     nv->header = (nvram_v3_header *)storage;
+
+    // The model is fully constructed here: it needs nothing from the machine,
+    // so it has no start hook, but it does contribute its store to the tree.
+    nv->device.name = "nvram";
+    nv->device.init = 0;
+    nv->device.adt_contribute = trestle_nvram_contribute;
+    nv->device.mmio_read = 0;
+    nv->device.mmio_write = 0;
+    nv->device.deinit = 0;
     return TRESTLE_OK;
 }
 
 // ---------------------------------------------------------------------------
 // Device-model entry point.
 // ---------------------------------------------------------------------------
-trestle_status trestle_nvram_contribute(trestle_device *dev, void *node)
+trestle_status trestle_nvram_contribute(trestle_device *dev, trestle_adt *adt)
 {
     trestle_nvram *nv = (trestle_nvram *)dev;
+    int            chosen;
 
-    // The device-tree builder is not yet a Trestle component: on the QEMU
-    // bring-up the platform description is produced by
-    // gatehouse/dt/build_adt.py, which mirrors this model.  When Trestle owns
-    // the tree, this emits, on /chosen:
-    //
-    //     nvram-total-size = <nv->size>
-    //     nvram-bank-size  = <nv->size>
-    //     nvram-bank-count = <1>
-    //     nvram-current-bank = <0>
-    //     nvram-raw        = <nv->raw>
-    //     nvram-proxy-data = <nv->image, nv->size>
-    //
-    // See docs/design.md ("Device tree ownership").
-    TRESTLE_UNUSED(node);
-    if (nv == 0) {
+    if (nv == 0 || adt == 0) {
         return TRESTLE_ERR_INVAL;
     }
-    return TRESTLE_ERR_NOTSUP;
+    chosen = trestle_adt_find(adt, "/chosen");
+    if (chosen == TRESTLE_ADT_NO_NODE) {
+        return TRESTLE_ERR_NOTFOUND;
+    }
+
+    // The factory reads the store out of /chosen and picks a handler from the
+    // image's first bytes, so every property it looks at has to be here: the
+    // bank geometry it passes as the image size, the raw flag init() requires,
+    // and the image itself.
+    if (trestle_adt_set_u32(adt, chosen, "nvram-total-size", (u32)nv->size) !=
+            TRESTLE_OK ||
+        trestle_adt_set_u32(adt, chosen, "nvram-bank-size", (u32)nv->size) !=
+            TRESTLE_OK ||
+        trestle_adt_set_u32(adt, chosen, "nvram-bank-count", 1) != TRESTLE_OK ||
+        trestle_adt_set_u32(adt, chosen, "nvram-current-bank", 0) !=
+            TRESTLE_OK ||
+        trestle_adt_set_u32(adt, chosen, "nvram-raw", (u32)nv->raw) !=
+            TRESTLE_OK ||
+        trestle_adt_set_data(adt, chosen, "nvram-proxy-data", nv->image,
+                             nv->size) != TRESTLE_OK) {
+        return TRESTLE_ERR_NOMEM;
+    }
+    return TRESTLE_OK;
 }

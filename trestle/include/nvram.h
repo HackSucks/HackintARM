@@ -91,9 +91,11 @@ trestle_status trestle_nvram_init(trestle_nvram *nv, u8 *storage, usize size);
 // True when `image` starts with a valid V3 header for `size` bytes.
 int trestle_nvram_is_valid(const u8 *image, usize size);
 
-// Device-model entry point.  When Trestle owns the device tree this publishes
-// the image on /chosen as "nvram-total-size"/"nvram-bank-size" and
-// "nvram-proxy-data"; today Gatehouse's dt/build_adt.py mirrors it.
-trestle_status trestle_nvram_contribute(trestle_device *dev, void *node);
+// Device-model entry point: publish the store on /chosen as
+// "nvram-total-size"/"nvram-bank-size"/"nvram-proxy-data".  The image is the
+// V3 one the factory needs (see the header comment); the tree this lands in is
+// Trestle's (include/adt.h), and gatehouse/dt/build_adt.py mirrors the same
+// properties for the bring-up tree.
+trestle_status trestle_nvram_contribute(trestle_device *dev, trestle_adt *adt);
 
 #endif // TRESTLE_NVRAM_H

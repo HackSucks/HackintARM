@@ -9,6 +9,7 @@
 
 # Trestle test binaries
 trestle/tests/nvram_test
+trestle/tests/adt_test
 
 # Python
 __pycache__/

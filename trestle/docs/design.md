@@ -67,7 +67,7 @@ The three Trestle sub-systems:
 typedef struct trestle_device {
     const char *name;
     trestle_status (*init)(struct trestle_device *, const trestle_machine *);
-    trestle_status (*adt_contribute)(struct trestle_device *, void *node);
+    trestle_status (*adt_contribute)(struct trestle_device *, trestle_adt *);
     trestle_status (*mmio_read)(struct trestle_device *, u64, usize, u64 *);
     trestle_status (*mmio_write)(struct trestle_device *, u64, usize, u64);
     void           (*deinit)(struct trestle_device *);
@@ -75,10 +75,14 @@ typedef struct trestle_device {
 ```
 
 A device is *portable* when its behaviour depends only on `trestle_machine`,
-never on a hard-coded address. The address it lives at is decided by the device
-tree builder; the model itself is address-free. This is the same separation
-Gatehouse uses: the bootloader is portable because the only thing tying it to a
-board is `dt/build_adt.py`.
+never on a hard-coded address. The machine description says where each device's
+registers are (`trestle_machine_window`: a name, an offset from the SoC base, a
+size and its GIC interrupt id), and `init` is where a model resolves its own
+windows; a window that the machine does not have means the device is not
+present, and the model then contributes no nodes at all. `adt_contribute` is
+where it publishes what it *does* have, into the shared builder. So the same
+model serves QEMU's virt machine and the Apple virtual platform, and the only
+file that changes between them is `src/machines.c`.
 
 ## 4. Case study: NVRAM
 
@@ -156,26 +160,48 @@ the image; the device tree builder publishes it as `/chosen`'s
 
 ## 5. Device tree ownership
 
-Today the device tree is produced offline, by `gatehouse/dt/build_adt.py`, and
-the NVRAM contribution is mirrored there so the QEMU bring-up can move without
-Trestle running yet. That mirror is the *contract*, not the architecture.
+Trestle owns the builder (`src/adt.c`): it produces the pexpert encoding --
+`DeviceTreeNode { nProperties, nChildren }` followed by the properties and then
+the children, values padded to four bytes, integers little-endian, strings
+carrying their NUL -- and every device contributes into it through
+`adt_contribute`. The platform's own nodes, and the phandle numbering, are in
+`src/platform_nodes.c`; `src/boot.c` lists the devices and assembles them.
 
-The target is for Trestle to own the tree: each device's `adt_contribute` emits
-its nodes and properties, and Gatehouse asks Trestle for the finished blob
-before it jumps. At that point `build_adt.py` becomes the bring-up stand-in for
-the Trestle tree builder, and the two are kept in step by tests.
+`gatehouse/dt/build_adt.py` still produces the tree Gatehouse hands XNU on the
+bring-up, because Trestle is not on the boot path yet. It is now the *stand-in*
+for the Trestle builder, and the two are held in step by
+
+    tools/adt_diff.py build/gatehouse.adt <Trestle's tree>
+
+which compares them node by node and property by property, ignoring order.
+`tests/adt_test.c` writes Trestle's tree out, so the check is mechanical: for
+the bring-up machine the two are currently identical, byte for byte.
 
 ## 6. Machine portability
 
 | Concern | Portable part | Machine-specific part |
 |---------|---------------|-----------------------|
-| Device behaviour | the model (`src/*.c`) | none |
-| Where devices live | device tree builder | nothing |
+| Device behaviour | the model (`src/rtc.c`, `src/panic.c`, ...) | none |
+| Where devices live | building the tree (`src/adt.c`, `src/platform_nodes.c`) | the windows in `src/machines.c` |
 | How accesses arrive | the model's `mmio_*` | the trap/route layer |
-| Where RAM is | `trestle_machine` | supplied by Gatehouse |
+| RAM, SoC base, GIC regions | `trestle_machine` | `src/machines.c` (boot facts filled in by Gatehouse) |
+| Who the machine is | the tree's identity nodes | `src/machines.c` |
 
-The plan is that no file under `src/` mentions a board: the same NVRAM model
-serves the QEMU bring-up, a later hypervisor build, and real hardware.
+Two descriptions exist: `trestle_machine_qemu_virt()` (the bring-up target) and
+`trestle_machine_avp()` (the Apple virtual platform, whose windows come from the
+reference device tree). No file under `src/` other than `machines.c` mentions a
+board, and `tests/adt_test.c` builds both trees from the same models to keep it
+that way.
+
+The devices Trestle currently models, and what each one is for:
+
+| Device | `src/` | Why it is on the boot path |
+|--------|--------|----------------------------|
+| NVRAM store | `nvram.c` | `IONVRAMV3Handler` (see §4) |
+| PL031 RTC | `rtc.c` | the kernel's time base; the AVP also has `avp-rtc` |
+| Power manager | `pmgr.c` | the root power domain Image4 waits for; the PSCI conduit |
+| Panic log | `panic.c` | `/pram` + `embedded-panic-log-size`, and `qemu,pvpanic-mmio` |
+| CTRR / sealed registers | `aprr.c` | `/chosen` `kernel-ctrr-to-be-enabled`, `/chosen/lock-regs` |
 
 ## 7. Relationship to Gatehouse
 
@@ -191,15 +217,20 @@ bring-up decision, not a design one: the device models are the same either way.
 
 ## 8. Roadmap
 
-1. **NVRAM** — model + V3 image + the full `/chosen` contract (`nvram-bank-*`,
-   `nvram-raw`, `nvram-proxy-data`) + tests; unblocks `IONVRAMV3Handler`.
-2. **Device tree builder** — move ADT construction into Trestle; make devices
-   contribute their own nodes.
-3. **The rest of the early platform** — the devices the next failures ask for
-   (RTC, panic log, the AVP role devices seen in the authentic ADT:
-   `avp,rtc`, `qemu,pvpanic-mmio`, `paravirtualizedgraphics,*`).
+1. ~~**NVRAM** — model + V3 image + the full `/chosen` contract~~ done.
+2. ~~**Device tree builder** — ADT construction inside Trestle, devices
+   contributing their own nodes~~ done (`src/adt.c`); kept in step with
+   `build_adt.py` by `tools/adt_diff.py`.
+3. **The early platform** — the RTC, the power manager, the panic log and the
+   configuration registers are modelled (`src/rtc.c`, `src/pmgr.c`,
+   `src/panic.c`, `src/aprr.c`). Still to do: the AVP's graphics and
+   `iosurface-mapper` roles, the AES window, and `pcie` — the last of which is
+   wanted for attaching a root volume.
 4. **Trap/route layer** — only once a device must be emulated rather than
-   described.
+   described. The `mmio_*` contract is already the shape it feeds.
+5. **Put Trestle on the boot path** — Gatehouse calls `trestle_main()` and
+   plants the returned tree at `boot_args->deviceTreeP`, at which point
+   `build_adt.py` retires to being a reference.
 
 ## 9. Non-goals
 
