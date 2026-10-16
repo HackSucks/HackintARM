@@ -7,12 +7,18 @@ ipsw_extract.py -- pull individual members out of a (huge) Apple IPSW over HTTP.
 
 Apple's restore images are ~25 GiB ZIP archives and we usually want a handful of
 files out of them: the kernelcache (the kernel collection: XNU + every prelinked
-kext), BuildManifest.plist, and later the root-volume images.  Downloading the
-whole archive to read a 100 MiB member is wasteful, so instead we
+kext), BuildManifest.plist, and the root-volume images.  Downloading the whole
+archive to read one member is wasteful, so instead we
 
   1. read the zip64 end-of-central-directory record with a small Range request,
   2. Range-fetch the central directory and parse the member list,
-  3. Range-fetch the wanted member (local header + data) and inflate it.
+  3. Range-fetch the wanted member (local header + data) and stream it out.
+
+Members can be several GiB (the root-volume DMGs), so extraction streams to the
+output file in chunks instead of buffering the whole member.  A stored member
+(method 0) is byte-identical to its data in the archive, so a partial output
+file is resumed on a re-run -- a dropped connection over a 25 GiB archive is
+recoverable by just running the same command again.
 
 This needs the server to honour Range requests; Apple's CDN does.
 
@@ -22,24 +28,36 @@ Usage:
 """
 
 import argparse
+import os
 import struct
-import sys
+import time
 import urllib.request
 import zlib
 
-BLOCK = 1 << 17
+BLOCK = 1 << 17          # window used to find the end-of-central-directory
+CHUNK = 32 << 20         # Range-fetch granularity while extracting
+RETRIES = 8
 
 
 def content_length(url):
     req = urllib.request.Request(url, method="HEAD")
-    with urllib.request.urlopen(req) as r:
+    with urllib.request.urlopen(req, timeout=60) as r:
         return int(r.headers["Content-Length"])
 
 
 def fetch(url, start, end):
-    req = urllib.request.Request(url, headers={"Range": "bytes=%d-%d" % (start, end)})
-    with urllib.request.urlopen(req) as r:
-        return r.read()
+    """Range-fetch [start, end] inclusive, with backoff on transient errors."""
+    last = None
+    for attempt in range(RETRIES):
+        try:
+            req = urllib.request.Request(
+                url, headers={"Range": "bytes=%d-%d" % (start, end)})
+            with urllib.request.urlopen(req, timeout=180) as r:
+                return r.read()
+        except Exception as e:                      # noqa: BLE001
+            last = e
+            time.sleep(min(2 ** attempt, 30))
+    raise last
 
 
 def zip64_directory(url, size):
@@ -92,27 +110,62 @@ def parse_central_directory(cd):
         off += 46 + nlen + elen + clen
 
 
-def extract(url, member, out_path):
+def data_offset(url, member):
+    """Read the member's local header to locate its data (CD extra may differ)."""
     hdr = fetch(url, member["lho"], member["lho"] + 29)
     if hdr[:4] != b"PK\x03\x04":
         raise SystemExit("bad local header for %s" % member["name"])
     nlen, elen = struct.unpack_from("<HH", hdr, 26)
-    data_off = member["lho"] + 30 + nlen + elen
+    return member["lho"] + 30 + nlen + elen
 
-    print("fetching %s (%d bytes compressed) ..." % (member["name"], member["csize"]))
-    raw = fetch(url, data_off, data_off + member["csize"] - 1)
+
+def extract(url, member, out_path, resume=True):
+    doff = data_offset(url, member)
+    csize, usize = member["csize"], member["usize"]
+    print("extracting %s (compressed %d, uncompressed %d, method %d)"
+          % (member["name"], csize, usize, member["method"]), flush=True)
+    t0 = time.time()
+
     if member["method"] == 0:
-        data = raw
+        # stored: the archive bytes are the file, so resume a partial output.
+        have = os.path.getsize(out_path) if (resume and os.path.exists(out_path)) else 0
+        if have > csize:
+            have = 0
+        if have:
+            print("  resuming at %d/%d (%.1f%%)" % (have, csize, 100.0 * have / csize),
+                  flush=True)
+        with open(out_path, "r+b" if have else "wb") as f:
+            f.seek(have)
+            pos = have
+            while pos < csize:
+                n = min(CHUNK, csize - pos)
+                f.write(fetch(url, doff + pos, doff + pos + n - 1))
+                pos += n
+                mb = (pos - have) / (1 << 20)
+                rate = mb / max(time.time() - t0, 1e-6)
+                print("  %6.2f%%  %d/%d  (%.1f MiB/s)"
+                      % (100.0 * pos / csize, pos, csize, rate),
+                      end="\r", flush=True)
+        print()
     elif member["method"] == 8:
-        data = zlib.decompress(raw, -15)
+        # deflate: stream-decompress (cannot resume mid-stream).
+        d = zlib.decompressobj(-15)
+        pos = 0
+        with open(out_path, "wb") as f:
+            while pos < csize:
+                n = min(CHUNK, csize - pos)
+                f.write(d.decompress(fetch(url, doff + pos, doff + pos + n - 1)))
+                pos += n
+                print("  %6.2f%%" % (100.0 * pos / csize), end="\r", flush=True)
+            f.write(d.flush())
+        print()
     else:
         raise SystemExit("unsupported compression method %d" % member["method"])
 
-    if len(data) != member["usize"]:
-        raise SystemExit("size mismatch: got %d want %d" % (len(data), member["usize"]))
-    with open(out_path, "wb") as f:
-        f.write(data)
-    print("wrote %s (%d bytes)" % (out_path, len(data)))
+    got = os.path.getsize(out_path)
+    if got != usize:
+        raise SystemExit("size mismatch: got %d want %d" % (got, usize))
+    print("wrote %s (%d bytes)" % (out_path, got), flush=True)
 
 
 def main():
@@ -122,6 +175,7 @@ def main():
     ap.add_argument("--match", default=None)
     ap.add_argument("--extract")
     ap.add_argument("--out")
+    ap.add_argument("--no-resume", action="store_true")
     args = ap.parse_args()
 
     size = content_length(args.url)
@@ -137,13 +191,14 @@ def main():
             raise SystemExit("no such member: %s" % args.extract)
         if not args.out:
             raise SystemExit("--out is required with --extract")
-        extract(args.url, hits[0], args.out)
+        extract(args.url, hits[0], args.out, resume=not args.no_resume)
         return
 
     for m in members:
         if args.match and args.match not in m["name"]:
             continue
-        print("%12d  %s" % (m["usize"], m["name"]))
+        print("%14d  %14d  m%d  %s"
+              % (m["usize"], m["csize"], m["method"], m["name"]))
 
 
 if __name__ == "__main__":

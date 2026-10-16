@@ -41,7 +41,9 @@ KERNEL=kernel/kernelcache.release.vma2.kc GDB=0 ./qemu/run.sh
 ```
 
 `kernel/` is not distributed with this repo; extract the images from a
-legitimate Apple IPSW (`tools/ipsw_extract.py`, `tools/im4p_extract.py`).
+legitimate Apple IPSW (`tools/ipsw_extract.py`, `tools/im4p_extract.py`). The
+restore image we use, its build identity, and the member map are in
+[`docs/ipsw.md`](docs/ipsw.md).
 
 ## Licence
 
@@ -75,7 +77,15 @@ Walls cleared so far:
 
 Bring-up now loads the full kext set (`AppleARMPlatform`,
 `AppleVirtualPlatform`, `AppleVirtIO*`, `IOTimeSyncFamily`, `IOgPTPPlugin`, …)
-with **no panic** and runs on into late service startup. It stops there because
-the only disk attached is the EFI partition — there is no macOS system volume to
-mount, and on real vmapple the remaining platform devices (NVRAM, timers, GIC
-routing) are virtio/AAPL devices that Trestle is meant to emulate.
+with **no panic**. It then stalls in late service startup on repeated
+`Kext com.apple.driver.AppleARMPlatform is already loaded` — the stage right
+before it would go looking for a root volume to mount.
+
+The root volume itself is `043-70867-635.dmg.aea` in the IPSW, an
+**AEA-encrypted** image whose key comes from Apple's WKMS during the
+device-bound restore flow (see [`docs/ipsw.md`](docs/ipsw.md)); it is being
+grabbed to `/mnt/windows2` so that the mount path can be developed against it,
+but reading it needs the restore key or a substitute volume.
+
+The remaining platform devices (NVRAM, timers, GIC routing) are virtio/AAPL
+devices that Trestle is meant to emulate.
