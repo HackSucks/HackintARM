@@ -35,7 +35,7 @@ straight to disk and resumes a partial stored member on a re-run.
 |---|---|---|
 | `kernelcache.release.vma2` | ~22 MiB | the kernel collection (XNU + prelinked kexts) gatehouse loads |
 | `BuildManifest.plist` | 31 MiB | identity/member table |
-| `043-70867-635.dmg.aea` | 11.27 GiB | **the root volume** (`OS` in the manifest), AEA-encrypted |
+| `043-70867-635.dmg.aea` | 11.27 GiB | **the root volume** (`OS`), AEA profile 1 (decryptable — see below) |
 | `094-86031-269.dmg` | 7.71 GiB | `Cryptex1,RosettaOS` — plain raw APFS image |
 | `043-70637-685.dmg` | 54 MiB | `Cryptex1,AppOS` — plain raw APFS image |
 | `043-70833-682.dmg` | 373 MiB | `RestoreRamDisk` — IM4P-wrapped payload |
@@ -54,26 +54,54 @@ UDIF disk images:
 * the ones beginning `30 84 .. .. 00 15 16 04 49 4d 34 50` (`IM4P`) are
   **IMG4 payloads** and must be unwrapped first (`tools/im4p_extract.py`).
 
-## The root volume is encrypted
+## The root volume is an encrypted APFS image
 
-`043-70867-635.dmg.aea` is an **AEA** (Apple Encrypted Archive). Its header
-names the key source:
+`043-70867-635.dmg.aea` is an **AEA** (Apple Encrypted Archive), profile 1
+(AES-CTR + HMAC-SHA256, no signature). It is the only copy of the root volume:
+the manifest has no plain DMG of `OS`, and the plain members above are the
+restore ramdisk and the cryptexes, not the root.
+
+The archive is **not device-bound**, so it can be decrypted here. Its auth data
+carries the key-delivery parameters:
 
 ```
-AEA1
-  com.apple.wkms.url        https://wkms.sd.apple.com
-  com.apple.wkms.auth-data  CqsEoZwYLKQ0wkJTzKAyrfy83Y6GJLOR0r8kyko...
+com.apple.wkms.url          https://wkms.sd.apple.com
+com.apple.wkms.auth-data    <base64>
+com.apple.wkms.fcs-response {"enc-request": <HPKE enc>, "wrapped-key": <HPKE ct>}
+com.apple.wkms.fcs-key-url  https://wkms-public.apple.com/fcs-keys/<id>= ->
+                            https://fcs-keys-pub-prod.cdn-apple.com/fcs-keys/<id>=
 ```
 
-so the archive's key comes from Apple's Web Key Management Service, which hands
-it out as part of the device-bound restore flow. It is not derivable offline
-from anything in the IPSW, and no key material ships as a member. Grabbing the
-image is therefore necessary but not sufficient to read the root filesystem;
-getting at its contents means either reproducing Apple's personalisation
-against WKMS or providing the volume some other way.
+The key URL is a public PEM (a P-256 private key on Apple's CDN). The 32-byte
+symmetric key is HPKE-sealed (`DHKEM(P-256, HKDF-SHA256)` + `HKDF-SHA256` +
+`AES-256-GCM`, RFC 9180 base mode) to it, so decrypting needs only that fetch —
+no device, no personalisation:
 
-The manifest's `Cryptex1,SystemOS` (also AEA) and the two plain APFS cryptexes
-are the pieces of the root filesystem that Apple decrypts into place at boot.
+`tools/aea_decrypt.py --fcs` does this and streams the AEA out of the IPSW while
+decrypting it, so the encrypted copy is never written to disk.
+
+What comes out is **not** a UDIF `.dmg` but a **raw APFS container** — which is
+exactly the raw block-device image macOS wants (`NXSB`, 4 KiB blocks):
+
+```
+profile          1 (symmetric)
+inner size       14,189,330,432 bytes (13.21 GiB)
+segment size     1 MiB, 256 segments/cluster, 53 clusters
+compression      LZFSE
+checksum         SHA-256
+```
+
+Decrypting needs a Python with `cryptography` and an LZFSE decoder (`lzfse`,
+or `liblzfse.so`):
+
+```sh
+python3 -m venv .venv && .venv/bin/pip install cryptography lzfse
+PYTHON=.venv/bin/python tools/grab_vmapple_rootfs.sh /mnt/windows2/vmapple-rootfs
+```
+
+`Cryptex1,SystemOS` (2.42 GiB) and `BaseSystem` (1.31 GiB) are AEA of the same
+shape and decrypt the same way; the two plain APFS cryptexes are the pieces of
+the root filesystem Apple mounts into place at boot.
 
 ## Extracting
 
@@ -86,8 +114,15 @@ python3 tools/ipsw_extract.py --url "$URL" --list --match .dmg
 # pull one member to a path
 python3 tools/ipsw_extract.py --url "$URL" --extract BuildManifest.plist --out /tmp/BM.plist
 
-# kernel collection + root volume and the plain images
+# the kernel collection
 python3 tools/ipsw_extract.py --url "$URL" \
     --extract kernelcache.release.vma2 --out kernel/kernelcache.release.vma2
-tools/grab_vmapple_rootfs.sh /mnt/windows2/vmapple-rootfs
+
+# the root volume (decrypted) plus the plain images
+PYTHON=.venv/bin/python tools/grab_vmapple_rootfs.sh /mnt/windows2/vmapple-rootfs
+
+# just look at the root volume's header, without downloading the whole thing
+.venv/bin/python tools/aea_decrypt.py --url "$URL" \
+    --member 043-70867-635.dmg.aea --fcs --info
 ```
+

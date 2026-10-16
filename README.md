@@ -25,7 +25,7 @@ gatehouse/          UEFI bootloader (C + a little asm)
   dt/build_adt.py   builds the ADT blob handed to XNU
   src/, include/
 trestle/            hypervisor (in progress)
-tools/              host-side helpers (ADT/Mach-O/im4p/pbzx inspection)
+tools/              host-side helpers (ADT/Mach-O/im4p/pbzx/IPSW/AEA)
 qemu/               run.sh + GDB scripts for the QEMU virt bring-up
 kernel/             extracted Apple images (NOT in git — see LICENSING.md)
 ```
@@ -81,11 +81,12 @@ with **no panic**. It then stalls in late service startup on repeated
 `Kext com.apple.driver.AppleARMPlatform is already loaded` — the stage right
 before it would go looking for a root volume to mount.
 
-The root volume itself is `043-70867-635.dmg.aea` in the IPSW, an
-**AEA-encrypted** image whose key comes from Apple's WKMS during the
-device-bound restore flow (see [`docs/ipsw.md`](docs/ipsw.md)); it is being
-grabbed to `/mnt/windows2` so that the mount path can be developed against it,
-but reading it needs the restore key or a substitute volume.
+The root volume itself is `043-70867-635.dmg.aea` in the IPSW. It is an AEA
+(profile 1) archive, but it is **not** device-bound: its auth data names a
+public PEM and an HPKE-wrapped key, so `tools/aea_decrypt.py` decrypts it while
+Range-fetching it from Apple's CDN, producing a raw APFS container
+(`NXSB`, 13.21 GiB) — the raw block device macOS wants. See
+[`docs/ipsw.md`](docs/ipsw.md).
 
 The remaining platform devices (NVRAM, timers, GIC routing) are virtio/AAPL
 devices that Trestle is meant to emulate.
