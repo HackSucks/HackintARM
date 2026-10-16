@@ -25,6 +25,8 @@ Property values are opaque bytes; strings carry their NUL (XNU's
 SecureDTFindNodeWithStringProperty expects length == strlen + 1), each value is
 padded to 4 bytes, and integer properties are stored *little-endian* -- this is a
 native structure built by firmware, unlike a .dtb which is big-endian by spec.
+iBoot also sets bit 31 of `length` on string values; XNU never tests it, and
+this builder does not set it (matching the trees that have booted).
 
 What XNU's arm64 platform code looks for (pexpert/arm/), and therefore what
 this tree has to contain:
@@ -35,7 +37,9 @@ this tree has to contain:
                                        disables the serial console entirely
                                        (pe_identify_machine.c)
   * /cpus                           -> children with state = "running" and the
-                                       *-frequency properties (pe_identify_machine.c)
+                                       *-frequency properties
+                                       (pe_identify_machine.c,
+                                        ml_parse_cpu_topology)
   * a node named "defaults"         -> serial-device = <phandle>
                                        (pe_serial.c; missing -> panic)
   * the serial node                 -> AAPL,phandle, compatible = "arm,pl011",
@@ -44,12 +48,38 @@ this tree has to contain:
   * /product, /options, /defaults,  -> machine identity and the boot-manifest
     /chosen{,/manifest-properties,     tables that AppleImage4 (Kernelspace.cpp)
     /asmb}                             and the platform "mpo" policy code look up
-                                       by path and panic over if missing; copied
-                                       from the authentic VMApple ADT
+                                       by path and panic over if missing
 
 So the "SoC base" is the anchor the whole platform hangs off.  We pick the base
 of QEMU virt's platform device window (the GIC) and express every device as an
 offset from it.
+
+Beyond the kernel's own pexpert code, the *drivers* published by iBoot's
+platform kexts (com.apple.driver.AppleARMPlatform and
+com.apple.driver.AppleVirtualPlatform) bind to nodes and match on their
+properties, and IOKit services that never appear make their clients wait
+forever.  The boot reaches the end of kext loading and then parks in
+_processor_idle with no further output, which is that failure mode, so the
+tree below carries the whole platform surface the authentic VMApple ADT
+(kernel/DeviceTree.vma2macosap.adt) publishes, with this machine's own
+addresses, phandles and devices:
+
+    root            aliases, machine-timeouts, memory, vram, pram,
+                    filesystems-props, buttons, port-virtual-1,
+                    osenvironments, pmgr, chosen, defaults, product,
+                    options, arm-io, cpus
+    /arm-io         gic, uart0, pl031-rtc, pl061-buttons
+    /chosen         the firmware policy properties plus the subnodes
+                    memory-map, manifest-(object-)properties, iBoot,
+                    secure-boot-hashes, boot-object-manifests,
+                    dynamic-object-map, carveout-memory-map, lock-regs,
+                    memory-report{,/zeroization-report}, asmb
+    /product        util, usb-device
+
+Nodes for devices this machine does not have are the job of the device models
+(Trestle) or of the driver they belong to; see trestle/src/ and docs/design.md
+for the mapping between the authentic AVP device offsets and the machines they
+are emulated on.
 
 Usage: build_adt.py [-o out.adt]   (default: build/gatehouse.adt)
 """
@@ -66,9 +96,10 @@ import sys
 # keeps every device offset positive while staying a real address.
 # ---------------------------------------------------------------------------
 SOC_BASE = 0x08000000              # gPESoCBasePhys: QEMU virt GIC base
+SOC_SIZE = 0x38000000              # /arm-io ranges: 0x08000000..0x40000000
+
 UART_PHYS = 0x09000000             # QEMU virt PL011
 UART_SIZE = 0x1000
-PHANDLE_UART0 = 1
 
 # QEMU virt's GICv3 (hw/arm/virt.c, memmap[]): the distributor and the
 # redistributor frames.  pe_init_fiq() (pexpert/pexpert/arm64/pe_fiq.c) looks
@@ -81,9 +112,66 @@ GICD_PHYS = 0x08000000
 GICD_SIZE = 0x10000
 GICR_PHYS = 0x080A0000
 GICR_SIZE = 0x0F6000
-PHANDLE_GIC = 2
+
+# The rest of QEMU virt's device window, from the machine's own DTB
+# (-M virt,dumpdtb=...).  The authentic VMApple platform carries the same two
+# devices; its *paravirtual* devices (avp-rtc, avp-ctrr, avp-sealed-registers,
+# pvpanic, pcie, aes, ...) have no QEMU backing and are left to Trestle, which
+# emulates them on the real machine.
+PL031_PHYS = 0x09010000            # PL031 RTC
+PL031_SIZE = 0x1000
+PL061_PHYS = 0x09030000            # PL061 GPIO controller (the buttons)
+PL061_SIZE = 0x1000
+# QEMU virt wires the PL061 to SPI 7, and XNU's "interrupts" cells are raw GIC
+# ids, not SPI numbers: the architected PPI 7 that the cpu node publishes is
+# 0x17 = 23 (= PPI 7 + 16), and the authentic tree's 0x25 for this same
+# controller is SPI 5.  So the id is 32 + 7.
+PL061_IRQ = 39
 
 TIMEBASE_HZ = 24000000             # architected timer frequency (QEMU virt)
+
+# ---------------------------------------------------------------------------
+# Phandles.  XNU resolves a node by its AAPL,phandle property only, so the
+# numbering is ours to choose; we keep iBoot's from the authentic VMApple ADT
+# so the two trees line up node for node.  Two of them are load-bearing:
+# /defaults "serial-device" must be uart0's, and every "interrupt-parent" must
+# be the gic's.
+# ---------------------------------------------------------------------------
+PHANDLE_BUTTONS = 0x02
+PHANDLE_MACHINE_TIMEOUTS = 0x03
+PHANDLE_CHOSEN = 0x04
+PHANDLE_MANIFEST_PROPS = 0x05
+PHANDLE_MANIFEST_OBJECT_PROPS = 0x06
+PHANDLE_BOOT_OBJECT_MANIFESTS = 0x07
+PHANDLE_SECURE_BOOT_HASHES = 0x08
+PHANDLE_DYNAMIC_OBJECT_MAP = 0x09
+PHANDLE_MEMORY_MAP = 0x0A
+PHANDLE_CARVEOUT_MEMORY_MAP = 0x0B
+PHANDLE_LOCK_REGS = 0x0C
+PHANDLE_IBOOT = 0x0D
+PHANDLE_MEMORY_REPORT = 0x0E
+PHANDLE_ZEROIZATION_REPORT = 0x0F
+PHANDLE_ASMB = 0x10
+PHANDLE_OPTIONS = 0x11
+PHANDLE_CPUS = 0x12
+PHANDLE_CPU0 = 0x13
+PHANDLE_ALIASES = 0x33
+PHANDLE_MEMORY = 0x34
+PHANDLE_PMGR = 0x35
+PHANDLE_ARM_IO = 0x36
+PHANDLE_UART0 = 0x38
+PHANDLE_GIC = 0x39
+PHANDLE_PL031_RTC = 0x3D
+PHANDLE_PL061_BUTTONS = 0x40
+PHANDLE_PRAM = 0x44
+PHANDLE_VRAM = 0x45
+PHANDLE_DEFAULTS = 0x46
+PHANDLE_PRODUCT = 0x47
+PHANDLE_PRODUCT_USB = 0x48
+PHANDLE_PRODUCT_UTIL = 0x49
+PHANDLE_FILESYSTEMS_PROPS = 0x4A
+PHANDLE_PORT_VIRTUAL_1 = 0x4B
+PHANDLE_OSENVIRONMENTS = 0x4C
 
 # iBoot's panic region.  check_for_panic_log() (pexpert/arm/pe_init.c) reads it
 # out of the ADT as
@@ -171,10 +259,11 @@ def emit(n):
     return out
 
 
-# /chosen/manifest-properties is a fixed table of reserved slots that Image4
-# fills in while it processes the boot manifest: 20 64-bit integers, 20
-# booleans and 10 fixed-size strings.  The authentic ADT ships every slot
-# zeroed, so it is the table's *shape* that matters, not its contents.
+# /chosen/manifest-properties and /chosen/manifest-object-properties are fixed
+# tables of reserved slots that Image4 fills in while it processes the boot
+# manifest: 20 64-bit integers, 20 booleans and 10 fixed-size strings.  The
+# authentic ADT ships every slot zeroed, so it is the table's *shape* that
+# matters, not its contents.
 def reserved_manifest_properties():
     props = []
     for i in range(20):
@@ -184,6 +273,133 @@ def reserved_manifest_properties():
     for i in range(10):
         props.append(("UnusedStringProperty%d" % i, b"\0" * 64))
     return props
+
+
+# /chosen/memory-map is the same kind of table: iBoot reserves 16 slots that
+# it fills in with physical ranges (byte offset, byte length) for the boot
+# objects -- TrustCache, AuxKC, AuxKC-mach_header among them.  XNU's
+# arm_vm_prot_init() (osfmk/arm64/arm_vm_init.c) asserts that the *node* exists
+# and then reads each object out of it by name, so the reserved slots may stay
+# zeroed; "kernel-only" is a boolean the same code reads.
+def reserved_memory_map_properties():
+    return [("MemoryMapReserved-%d" % i, u64(0, 0)) for i in range(16)]
+
+
+# ---------------------------------------------------------------------------
+# /chosen: the firmware policy properties.
+#
+# The machine-specific parts of /chosen (dram-base/dram-size, random-seed, the
+# NVRAM store, the panic log size, the chip identity) are built in build()
+# below; everything here is a firmware *policy* literal, copied property for
+# property from the authentic VMApple ADT so that the security code
+# (AppleImage4, AMFI, the platform "mpo" policy, the credential manager) sees
+# exactly what iBoot publishes.  Properties iBoot frees after handing them to
+# the kernel -- random-seed, bootp-response, firmware-version,
+# host-os-information, cl4-entropy -- appear in the dump all-zero because the
+# kernel has already consumed them; the same *length* is used here so the
+# tree's shape is unchanged.
+#
+# One deliberate deviation: sepfw-load-at-boot is 0, not 1.  It tells the SEP
+# manager to load SEP firmware during boot, and this machine has no SEP.
+# ---------------------------------------------------------------------------
+CHOSEN_FIRMWARE_PROPERTIES = [
+    ("mix-n-match-prevention-status", u32(0)),
+    ("max-env-var-data-size", u32(0)),
+    ("software-bundle-version", s("syscfg/SBVr/0x10,zeroes/0x10")),
+    ("repair-environment", u32(0)),
+    ("repair-status", s("syscfg/rpcp")),
+    ("software-behavior", s("syscfg/SwBh/0x10,zeroes/0x10")),
+    ("effective-production-status-sep", u32(0)),
+    ("disable-transport-rm", u32(0)),
+    ("development-cert", u32(0)),
+    ("mac-address-wifi0", s("macaddr/wifiaddr,syscfg/WMac/6")),
+    ("marketing-hardware-behavior", s("syscfg/MkBH")),
+    ("isp-horizon", u32(0)),
+    ("max-env-partition", u32(0)),
+    ("mac-address-ethernet1", s("macaddr/ethaddr1,syscfg/EMc2/6")),
+    ("cs-system-policy", s("default")),
+    ("system-trusted", u32(0)),
+    ("display-rotation", u32(0)),
+    ("amfi-allows-trust-cache-load", u32(0)),
+    ("coverglass-color", s("syscfg/CLCG")),
+    ("sidp-rom-manifest-hash", bytes(48)),
+    ("sepfw-load-at-boot", u32(0)),
+    ("enable-sep-rm", u32(0)),
+    ("cryptex1-certificate-format", s("x509")),
+    ("dram-vendor-id", u32(0)),
+    ("display-boot-rotation", u32(0)),
+    ("protected-data-access", u32(1)),
+    ("secureboot-key-scheme", s("rsa4096")),
+    ("allow-whitelist-disable", u32(1)),
+    ("debug-board-revision", u32(0)),
+    ("certificate-security-mode", u32(0)),
+    ("host-os-information", bytes(128)),
+    ("disable-av-content-protection", u32(0)),
+    ("dram-vendor", bytes(16)),
+    ("mac-address-bluetooth0", s("macaddr/btaddr,syscfg/BMac/6")),
+    ("production-cert", u32(0)),
+    ("cryptex1-key-scheme", s("rsa4096")),
+    ("non-apple-or-untrusted-code", u32(1)),
+    ("ephemeral-storage", u32(0)),
+    ("mac-address-ethernet0", s("macaddr/ethaddr,syscfg/EMac/6")),
+    ("debug-enabled", u32(0)),
+    ("consistent-debug-root", u64(0)),
+    ("enclosure-material", s("syscfg/EnMt")),
+    ("effective-production-status-ap", u32(0)),
+    ("marketing-software-behavior", s("syscfg/MkBS")),
+    ("security-downgradable", u32(1)),
+    ("bootp-response", bytes(300)),
+    ("image4-cert-type", u32(0)),
+    ("backing-glass-material", s("syscfg/BGMt")),
+    ("cl4-entropy", bytes(192)),
+    ("darwinos-security-environment", u32(0)),
+    ("firmware-version", bytes(256)),
+    ("display-scale", u32(0)),
+    ("effective-security-mode-sep", u32(0)),
+    ("certificate-production-status", u32(0)),
+    ("apfs-preboot-uuid", bytes(38)),
+    ("darwinos-userspace-reboot", u32(0)),
+    ("allowed-boot-args", s("trace,trace_wake,kperf,-x,-v,trm_enabled,trace_typefilter,nox86exec")),
+    ("secureboot-certificate-format", s("x509")),
+    ("csr-allow-device-configuration", u32(0)),
+    ("recovery-snag-key-pressed", u32(0)),
+    ("#address-cells", u32(2)),
+    ("repair-history", s("syscfg/RCHL")),
+    ("enable-user-rm", u32(0)),
+    ("cover-glass-material", s("syscfg/CGMt")),
+    ("max-env-var-name-size", u32(0)),
+    ("osenvironment", bytes(32)),
+    ("unrestricted-subsystem-root", u32(0)),
+    ("use-recovery-securityd", u32(0)),
+    ("amfi-exec-req-tc", u32(0)),
+    ("disable-accessory-firmware", u32(0)),
+    ("boot-manifest-hash", bytes(48)),
+    ("display-corner-radius", u32(0)),
+    ("boot-type", b"local" + bytes(7)),
+    ("board-id", u32(0)),
+    ("housing-color", s("syscfg/CLHS")),
+    ("backing-color", s("syscfg/CLBG")),
+    ("effective-security-mode-ap", u32(0)),
+]
+
+# The same properties minus the ones built into the tree above, which are the
+# machine's identity rather than firmware policy.
+CHOSEN_IDENTITY_PROPERTIES = [
+    # Chip / secure-boot identity, copied from the authentic /chosen.
+    # AppleImage4 reads "crypto-hash-method" and maps "sha1"/"sha2-384"; if the
+    # property is absent the value is empty and it panics with "non-sensical
+    # crypto hash method".
+    ("unique-chip-id", u64(0)),
+    ("secure-boot", u32(0)),
+    ("chip-id", u32(0)),
+    ("boot-nonce", u64(0)),
+    ("die-id", u64(0)),
+    ("unique-device-id", bytes(16)),
+    ("gid-aes-key", u32(0)),
+    ("uid-aes-key", u32(0)),
+    ("image4-supported", b""),
+    ("allow-ap-nonce-retrieval", b""),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +470,9 @@ def nvram_proxy_data(size=NVRAM_SIZE):
 # different machine.
 # ---------------------------------------------------------------------------
 def build():
+    # ---------------------------------------------------------------------
+    # /arm-io: the SoC's device window.
+    # ---------------------------------------------------------------------
     uart = node(
         "uart0",
         ("compatible", s("arm,pl011")),
@@ -271,83 +490,196 @@ def build():
     # pe_init_fiq() walks the GICR frames at 0x20000 stride looking for the
     # frame whose GICR_TYPER affinity matches MPIDR_EL1 & 0xffff, so the
     # region has to cover CPU 0's frame (0x080A0000) with room to spare.
+    #
+    # The "interrupt-controller"/"device_type"/"#interrupt-cells" properties
+    # are what Apple's own interrupt-controller driver (AppleARMGIC on Apple
+    # Silicon, gic,vmappl1 on the AVP) matches on; without them IOKit never
+    # publishes an IOInterruptController and every client of
+    # IOService::registerInterrupt waits for it.  "arm,gic-v3" is kept in the
+    # compatible list for iBoot-compatible matchers.
     gic = node(
         "gic",
-        ("compatible", s("arm,gic-v3")),
+        ("compatible", s("gic,vmappl1") + s("ARM,gicv3") + s("arm,gic-v3")),
+        ("interrupt-controller", s("master")),
+        ("#interrupt-cells", u32(2)),
+        ("#address-cells", u32(0)),
+        ("device_type", s("interrupt-controller")),
         ("AAPL,phandle", u32(PHANDLE_GIC)),
         ("reg", u64(GICD_PHYS - SOC_BASE, GICD_SIZE,
                     GICR_PHYS - SOC_BASE, GICR_SIZE)),
     )
 
-    arm_io = node(
-        "arm-io",
-        ("device_type", s("vmapple")),
-        # pe_arm_get_soc_base_phys() takes ranges[1] as the SoC base.
-        ("ranges", u64(0, SOC_BASE)),
-        children=[gic, uart],
+    # The RTC.  QEMU virt has a real PL031; the authentic AVP carries both
+    # this node and its own paravirtual "avp-rtc", and AppleVirtualPlatform
+    # registers a driver for each (ApplePL031RTC, AppleVirtualPlatformRTC).
+    # The PL031 has no interrupt in the authentic tree, so none is described.
+    pl031_rtc = node(
+        "pl031-rtc",
+        ("compatible", s("ARM,pl031")),
+        ("AAPL,phandle", u32(PHANDLE_PL031_RTC)),
+        ("reg", u64(PL031_PHYS - SOC_BASE, PL031_SIZE)),
     )
 
+    # The buttons.  On the AVP these hang off a PL061 GPIO controller with
+    # role = "VMA1_BUTTONS"; QEMU virt has the same controller.
+    pl061_buttons = node(
+        "pl061-buttons",
+        ("compatible", s("ARM,pl061")),
+        ("role", s("VMA1_BUTTONS")),
+        ("interrupts", u32(PL061_IRQ, 0)),
+        ("interrupt-parent", u32(PHANDLE_GIC)),
+        ("AAPL,phandle", u32(PHANDLE_PL061_BUTTONS)),
+        ("reg", u64(PL061_PHYS - SOC_BASE, PL061_SIZE)),
+    )
+
+    arm_io = node(
+        "arm-io",
+        ("compatible", s("arm-io,vmapple1")),
+        # iBoot publishes "vmapple2-io" here; pe_identify_machine() identifies
+        # the machine from this node, and "vmapple" is the value the kernel
+        # code paths this port was brought up against expect.
+        ("device_type", s("vmapple")),
+        ("soc-generation", s("VMApple2")),
+        ("chip-revision", u32(0)),
+        ("#address-cells", u32(2)),
+        ("#size-cells", u32(2)),
+        ("AAPL,phandle", u32(PHANDLE_ARM_IO)),
+        # pe_arm_get_soc_base_phys() takes ranges[1] as the SoC base.  The
+        # third cell (the window size) is what iBoot publishes; 0 for the base
+        # means "no SoC" and disables the serial console entirely.
+        ("ranges", u64(0, SOC_BASE, SOC_SIZE)),
+        children=[gic, uart, pl031_rtc, pl061_buttons],
+    )
+
+    # ---------------------------------------------------------------------
+    # /cpus.
+    #
+    # state and reg are the two properties ml_parse_cpu_topology() requires;
+    # the rest are the CPU's identity and clock description, which
+    # AppleARMCPU and AppleARMPMU read off the node.  "interrupts" is the
+    # list iBoot publishes: GIC interrupt id 1 twice and GIC id 0x17 = PPI 7,
+    # the PMU overflow interrupt (the machine's own DTB wires PPI 7 to
+    # arm,armv8-pmuv3, so the ids are machine-neutral).
+    #
+    # The *-frequency values are the architected timer's frequency, which is
+    # what the platform declares for the timebase on the AVP as well (24 MHz,
+    # not the 1 GHz CNTFRQ_EL0 QEMU's max cpu reports -- XNU derives its
+    # conversions from CNTFRQ_EL0 on arm64 and uses these for the clock
+    # description it publishes to userland).
+    # ---------------------------------------------------------------------
     cpu0 = node(
         "cpu0",
-        ("state", s("running")),           # only "running" cpus are read
+        ("state", s("running")),                # only "running" cpus are read
+        ("compatible", s("ARM,v8")),
+        ("interrupt-parent", u32(PHANDLE_GIC)),
+        ("interrupts", u32(0x1, 0x1, 0x17, 0x1, 0x1, 0x1)),
+        ("cpu-id", u32(0)),
         # reg is the *physical* cpu id (MPIDR_EL1 AFF1:AFF0); XNU requires it
         # (ml_parse_cpu_topology: ML_READPROP_MANDATORY) and later matches it
         # against "MRS MPIDR_EL1 & (MPIDR_AFF1_MASK|MPIDR_AFF0_MASK)", so it
         # must be the masked value the architected timer/cpu-local code sees,
         # not QEMU's raw register (which carries the RES1 bit 31).
         ("reg", u32(0)),
-        ("timebase-frequency", u32(TIMEBASE_HZ)),
-        ("clock-frequency", u32(TIMEBASE_HZ)),
+        ("device_type", s("cpu")),
+        ("AAPL,phandle", u32(PHANDLE_CPU0)),
+        ("timebase-frequency", u64(TIMEBASE_HZ)),
+        ("clock-frequency", u64(TIMEBASE_HZ)),
+        ("memory-frequency", u64(TIMEBASE_HZ)),
+        ("peripheral-frequency", u64(TIMEBASE_HZ)),
+        ("fixed-frequency", u64(TIMEBASE_HZ)),
+        ("bus-frequency", u64(TIMEBASE_HZ)),
+        ("cpu-version", u32(0)),
+        # An empty property: XNU reads its presence, not its value.
+        ("function-enable_core", b""),
     )
 
-    cpus = node("cpus", children=[cpu0])
+    cpus = node(
+        "cpus",
+        ("#address-cells", u32(1)),
+        ("#size-cells", u32(0)),
+        ("AAPL,phandle", u32(PHANDLE_CPUS)),
+        children=[cpu0],
+    )
+
+    # ---------------------------------------------------------------------
+    # /chosen: the boot contract.
+    # ---------------------------------------------------------------------
 
     # arm_vm_prot_init() (osfmk/arm64/arm_vm_init.c) asserts that this node
     # exists: SecureDTLookupEntry(NULL, "chosen/memory-map", &mm) must return
-    # kSuccess before it reads TrustCache / AuxKC out of it.  TrustCache,
-    # AuxKC and AuxKC-mach_header are all optional (their absence is handled),
-    # so an empty node satisfies the assert.
-    memory_map = node("memory-map")
-
-    # ---------------------------------------------------------------------
-    # AppleImage4 (Kernelspace.cpp) and the platform-expert "mpo" policy code
-    # look these up by path and panic if they are absent:
-    #
-    #     panic: failed to get chosen node
-    #     panic: failed to get options node
-    #     panic: failed to get defaults node
-    #     panic: failed to get product node
-    #     panic: failed to get manifest properties
-    #
-    # and Image4 additionally *populates* /chosen, /product, /defaults,
-    # /chosen/manifest-properties and /chosen/asmb ("unable to setup ... node").
-    # The contents below mirror the authentic VMApple ADT
-    # (kernel/DeviceTree.vma2macosap.adt); only the phandle numbers differ,
-    # because we number our own devices from 1.
-    # ---------------------------------------------------------------------
-
-    # /options: an otherwise empty node; callers only test for its existence.
-    options = node(
-        "options",
-        ("AAPL,phandle", u32(0x11)),
+    # kSuccess before it reads TrustCache / AuxKC out of it.  Those objects
+    # and the 16 reserved slots iBoot leaves for boot objects are all
+    # optional (their absence is handled), so the reserved slots stay zeroed.
+    memory_map = node(
+        "memory-map",
+        ("AAPL,phandle", u32(PHANDLE_MEMORY_MAP)),
+        ("kernel-only", s("true")),
+        *reserved_memory_map_properties(),
     )
 
-    # /chosen/asmb: likewise.  Image4 publishes the local-policy properties
-    # (lp-sip0, lp-stng, ...) into it at runtime.
+    # The boot-object tables AppleImage4 and the SFR manifest code look up by
+    # path.  A real iBoot fills them in with the manifest hashes; an
+    # unpopulated but present node is what their "not found" paths tolerate.
+    manifest_object_props = node(
+        "manifest-object-properties",
+        ("AAPL,phandle", u32(PHANDLE_MANIFEST_OBJECT_PROPS)),
+        *reserved_manifest_properties(),
+    )
+    boot_object_manifests = node(
+        "boot-object-manifests",
+        ("AAPL,phandle", u32(PHANDLE_BOOT_OBJECT_MANIFESTS)),
+    )
+    secure_boot_hashes = node(
+        "secure-boot-hashes",
+        ("AAPL,phandle", u32(PHANDLE_SECURE_BOOT_HASHES)),
+    )
+    dynamic_object_map = node(
+        "dynamic-object-map",
+        ("AAPL,phandle", u32(PHANDLE_DYNAMIC_OBJECT_MAP)),
+    )
+    carveout_memory_map = node(
+        "carveout-memory-map",
+        ("AAPL,phandle", u32(PHANDLE_CARVEOUT_MEMORY_MAP)),
+    )
+    lock_regs = node(
+        "lock-regs",
+        ("AAPL,phandle", u32(PHANDLE_LOCK_REGS)),
+    )
+    # iBoot's timing report: consumed by the boot-perf code, zeroed once read.
+    iboot = node(
+        "iBoot",
+        ("AAPL,phandle", u32(PHANDLE_IBOOT)),
+        ("load-kernel-start", u32(0)),
+        ("debug-wait-start", u32(0)),
+        ("start-time", u32(0)),
+        ("populate-registry-time", u32(0)),
+    )
+    zeroization_report = node(
+        "zeroization-report",
+        ("AAPL,phandle", u32(PHANDLE_ZEROIZATION_REPORT)),
+    )
+    memory_report = node(
+        "memory-report",
+        ("AAPL,phandle", u32(PHANDLE_MEMORY_REPORT)),
+        children=[zeroization_report],
+    )
+
+    # /chosen/asmb: an otherwise empty node.  Image4 publishes the
+    # local-policy properties (lp-sip0, lp-stng, ...) into it at runtime.
     asmb = node(
         "asmb",
-        ("AAPL,phandle", u32(0x10)),
+        ("AAPL,phandle", u32(PHANDLE_ASMB)),
     )
 
     manifest_props = node(
         "manifest-properties",
-        ("AAPL,phandle", u32(0x5)),
+        ("AAPL,phandle", u32(PHANDLE_MANIFEST_PROPS)),
         *reserved_manifest_properties(),
     )
 
     chosen = node(
         "chosen",
-        ("AAPL,phandle", u32(0x4)),
+        ("AAPL,phandle", u32(PHANDLE_CHOSEN)),
         ("boot-args", s("debug=0x14e -v -noprogress serial=1 cpus=1 kextlog=0xfff keepsyms=1 exe_boothash_salt=0")),
         # arm_init() panics unless both are present; u64, little-endian.
         ("dram-base", u64(RAM_BASE)),
@@ -365,6 +697,9 @@ def build():
         ("kernel-ctrr-to-be-enabled", u32(0)),
         # check_for_panic_log() reads the size of the panic log from here.
         ("embedded-panic-log-size", u32(PANIC_SIZE)),
+        # AppleImage4's hash method and the machine's identity.
+        ("crypto-hash-method", s("sha2-384")),
+        *CHOSEN_IDENTITY_PROPERTIES,
         # The NVRAM store.  The factory reads nvram-bank-size and passes it to
         # IONVRAMV3Handler::create() as the image size, so the bank geometry,
         # nvram-total-size and the image size all have to agree.
@@ -377,28 +712,18 @@ def build():
         # OSData, and its first word selects raw vs. structured interpretation
         # of the store ([obj+0x2c] = value != 0).  iBoot provides it.
         ("nvram-raw", u32(0)),
-        # Chip / secure-boot identity, copied from the authentic /chosen.
-        # AppleImage4 reads "crypto-hash-method" and maps "sha1"/"sha2-384"; if
-        # the property is absent the value is empty and it panics with
-        # "non-sensical crypto hash method".  The rest is the set a real iBoot
-        # publishes on the VMApple platform (and what AppleImage4 consumes).
-        ("crypto-hash-method", s("sha2-384")),
-        ("unique-chip-id", u64(0)),
-        ("secure-boot", u32(0)),
-        ("chip-id", u32(0)),
-        ("boot-nonce", u64(0)),
-        ("die-id", u64(0)),
-        ("unique-device-id", bytes(16)),
-        ("gid-aes-key", u32(0)),
-        ("uid-aes-key", u32(0)),
-        ("image4-supported", b""),
-        ("allow-ap-nonce-retrieval", b""),
-        children=[memory_map, manifest_props, asmb],
+        *CHOSEN_FIRMWARE_PROPERTIES,
+        children=[memory_map, manifest_props, manifest_object_props, asmb,
+                  boot_object_manifests, secure_boot_hashes, dynamic_object_map,
+                  carveout_memory_map, lock_regs, iboot, memory_report],
     )
 
+    # /defaults: platform tuning.  pe_serial.c reads "serial-device" (the
+    # uart0 phandle) and panics without it; the rest is copied from the
+    # authentic ADT.
     defaults = node(
         "defaults",
-        ("AAPL,phandle", u32(0x46)),
+        ("AAPL,phandle", u32(PHANDLE_DEFAULTS)),
         ("serial-device", u32(PHANDLE_UART0)),   # -> /arm-io/uart0
         ("vmm-present", u32(1)),
         ("force-sep-nonce", u32(1)),
@@ -412,10 +737,42 @@ def build():
     )
 
     # /product: the machine's identity, copied property-for-property from the
-    # authentic VMApple ADT.
+    # authentic VMApple ADT, plus the two subnodes iBoot publishes with it.
+    #
+    # "util" is the region descriptor table the platform's util-storage driver
+    # (AppleVirtualPlatformUtilStorage) looks up by path; "usb-device"
+    # describes the virtual USB device controller the AVP presents (NCM =
+    # network-control-model Ethernet over USB).
+    product_util = node(
+        "util",
+        ("AAPL,phandle", u32(PHANDLE_PRODUCT_UTIL)),
+        ("reg", b""),
+        ("low-level-fw-device-info", u32(1)),
+        ("regions", bytes.fromhex(
+            "01000000000000000000a000020000000000a0000000100003"
+            "0000000000b0000000500007000000000000010010000004000"
+            "0000010000100f04f0005000000000050010000500006000000"
+            "0000a00100006000")),
+        ("fw-regions", bytes.fromhex(
+            "000000000000020000000200000020000000220000002000")),
+    )
+
+    product_usb = node(
+        "usb-device",
+        ("AAPL,phandle", u32(PHANDLE_PRODUCT_USB)),
+        ("ncm-self-name-unit", u32(0)),
+        ("ncm-interrupt-ep-disabled", u32(1)),
+        ("ncm-control-ecid-mac", u32(1)),
+        ("configuration-string", s("ncmAuxBringup")),
+        ("product-string", s("macOS Virtual Machine")),
+        # Apple's USB vendor id: this is the identity the VM presents to the
+        # host, not a device the kernel drives.
+        ("vendor-id", u32(0x5AC)),
+    )
+
     product = node(
         "product",
-        ("AAPL,phandle", u32(0x47)),
+        ("AAPL,phandle", u32(PHANDLE_PRODUCT)),
         ("has-virtualization", u32(1)),
         ("location-reminders", u32(0)),
         ("graphics-featureset-fallbacks", s("APPLE6:APPLE5:APPLE4:APPLE3:APPLE3v1:APPLE2:APPLE1:GLES2,0")),
@@ -458,19 +815,136 @@ def build():
         ("artwork-scale-factor", u32(2)),
         ("artwork-device-idiom", s("mac")),
         ("artwork-display-gamut", s("P3")),
+        children=[product_util, product_usb],
     )
+
+    # /options: an otherwise empty node; callers only test for its existence.
+    options = node(
+        "options",
+        ("AAPL,phandle", u32(PHANDLE_OPTIONS)),
+    )
+
+    # ---------------------------------------------------------------------
+    # The rest of the root: nodes the platform drivers bind to.
+    # ---------------------------------------------------------------------
 
     # check_for_panic_log() (pexpert/arm/pe_init.c) looks up "pram" at the root
     # and takes reg[0] as the panic region's physical address.
     pram = node(
         "pram",
+        ("device_type", s("pram")),
+        ("AAPL,phandle", u32(PHANDLE_PRAM)),
         ("reg", u64(PANIC_PHYS, PANIC_SIZE)),
+    )
+
+    aliases = node(
+        "aliases",
+        ("AAPL,phandle", u32(PHANDLE_ALIASES)),
+    )
+
+    # The timeout scales XNU applies to locks and interrupt-masked sections.
+    # Every scale is zero on the VMApple platform ("no scaling"), but the node
+    # has to exist for the code that reads it.
+    machine_timeouts = node(
+        "machine-timeouts",
+        ("AAPL,phandle", u32(PHANDLE_MACHINE_TIMEOUTS)),
+        ("lock-scale", u32(0)),
+        ("debug-ack-scale", u32(0)),
+        ("lock-panic-scale", u32(0)),
+        ("interrupt-masked-b-scale", u32(0)),
+        ("interrupt-masked-scale", u32(0)),
+        ("sched-preemption-disable-mode", u32(0)),
+        ("gicr-wake-timeout-scale", u32(0)),
+        ("sshot-interrupt-masked-scale", u32(0)),
+        ("ticket-lock-scale", u32(0)),
+        ("interrupt-masked-debug-mode", u32(0)),
+    )
+
+    # reg is zeroed in the authentic tree: the kernel takes the memory map from
+    # boot_args, and these two nodes only mark the device types.
+    memory = node(
+        "memory",
+        ("device_type", s("memory")),
+        ("AAPL,phandle", u32(PHANDLE_MEMORY)),
+        ("reg", u64(0)),
+    )
+
+    vram = node(
+        "vram",
+        ("device_type", s("vram")),
+        ("AAPL,phandle", u32(PHANDLE_VRAM)),
+        ("reg", u64(0, 0)),
+    )
+
+    # Filesystem policy: the inode/snapshot cache size and the fact that this
+    # platform does not use APFS crypto.
+    filesystems_props = node(
+        "filesystems-props",
+        ("AAPL,phandle", u32(PHANDLE_FILESYSTEMS_PROPS)),
+        ("isc_size", u32(0x1F400000)),
+        ("apfs-crypto-disabled", u32(1)),
+    )
+
+    buttons = node(
+        "buttons",
+        ("AAPL,phandle", u32(PHANDLE_BUTTONS)),
+        ("aot-power", u32(1)),
+    )
+
+    # The virtual USB port the AVP exposes to its host.
+    port_virtual_1 = node(
+        "port-virtual-1",
+        ("port-type", u32(1)),
+        ("transports-supported", u32(2)),
+        ("port-number", u32(1)),
+        ("device_type", s("port-virtual")),
+        ("AAPL,phandle", u32(PHANDLE_PORT_VIRTUAL_1)),
+    )
+
+    osenvironments = node(
+        "osenvironments",
+        ("AAPL,phandle", u32(PHANDLE_OSENVIRONMENTS)),
+    )
+
+    # /pmgr: the power manager.  XNU's platform code and ApplePSCI bind to it;
+    # without it there is no root power domain, and AppleImage4 (which reads
+    # the domain before it will evaluate the boot manifest) reports
+    # "root power domain not yet available" and waits.
+    pmgr = node(
+        "pmgr",
+        ("compatible", s("ARM,psci")),
+        ("AAPL,phandle", u32(PHANDLE_PMGR)),
     )
 
     root = node(
         "device-tree",
-        ("model", s("Gatehouse virtual platform")),
-        ("target-type", s("vmapple")),
+        # The machine's identity.  pe_identify_machine() and the platform
+        # expert read these at boot: the model, the target type, the
+        # manufacturer and the serial/region numbers become the platform
+        # expert's own properties (IOPlatformSerialNumber, hw.model, ...).
+        # The target types are iBoot's own ("VMA2MACOS"/"VMA2MACOSAP"); the
+        # machine-specific strings are Gatehouse's, because this is not an
+        # Apple-serialised machine (iBoot fills these in from the syscfg
+        # region on a real one).
+        ("AAPL,phandle", u32(0x01)),
+        ("device_type", s("bootrom")),
+        ("device-tree-tag", s("EmbeddedDeviceTrees-12661.1.5")),
+        ("manufacturer", s("Apple Inc.")),
+        ("model", s("VirtualMac2,1")),
+        ("model-config", s("HackintARM")),
+        ("model-number", s("HACKINTARM1")),
+        ("target-type", s("VMA2MACOS")),
+        ("target-sub-type", s("VMA2MACOSAP")),
+        ("serial-number", s("HACKINTARM0001")),
+        ("mlb-serial-number", s("HACKINTARMMLB0001")),
+        ("config-number", s("HACKINTARM0001")),
+        ("regulatory-model-number", s("HACKINTARM1")),
+        ("region-info", s("LL/A")),
+        ("country-of-origin", s("US")),
+        ("secure-root-prefix", s("md")),
+        ("platform-name", bytes(32)),
+        ("clock-frequency", u32(0)),
+        ("time-stamp", s("Thu Jan 1 00:00:00 UTC 2026")),
         # AppleVirtualPlatformARMPE (com.apple.driver.AppleVirtualPlatform)
         # matches its provider with IONameMatch = "AppleVirtualPlatformARM",
         # and IODTCompareNubName tests the node's compatible as well as its
@@ -482,7 +956,9 @@ def build():
          + s("VirtualMac2,1")),
         ("#address-cells", u32(2)),
         ("#size-cells", u32(2)),
-        children=[chosen, defaults, product, options, arm_io, cpus, pram],
+        children=[chosen, defaults, product, options, arm_io, cpus, pram,
+                  aliases, machine_timeouts, memory, vram, filesystems_props,
+                  buttons, port_virtual_1, osenvironments, pmgr],
     )
     return root
 
