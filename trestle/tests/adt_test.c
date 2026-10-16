@@ -197,10 +197,25 @@ static void check_platform_contract(trestle_adt *adt,
 static void check_machine_specific(trestle_adt *adt,
                                    const trestle_machine *m)
 {
+    const trestle_machine_window *w;
+
     assert(strcmp(m->identity->model, "VirtualMac2,1") == 0);
     assert(prop_u64(adt, "/arm-io/pl031-rtc", "reg") != 0);
-    assert(prop_u32(adt, "/arm-io/pl061-buttons", "interrupt-parent") ==
-           TRESTLE_PHANDLE_GIC);
+
+    // The buttons controller is described only on a machine that can back it.
+    // AppleVirtualPlatform's GPIO driver binds to the node and writes
+    // GPIOIEV/GPIOIE (0x40c/0x410) when it starts, so a node whose window has
+    // no device behind it takes a synchronous external abort in the kernel --
+    // bring-up catches this because the machine description has no window for
+    // it.
+    w = trestle_machine_find_window(m, "pl061-buttons");
+    if (w != 0) {
+        assert(prop_u32(adt, "/arm-io/pl061-buttons", "interrupt-parent") ==
+               TRESTLE_PHANDLE_GIC);
+    } else {
+        assert(trestle_adt_find(adt, "/arm-io/pl061-buttons") ==
+               TRESTLE_ADT_NO_NODE);
+    }
 }
 
 int main(int argc, char **argv)
@@ -274,6 +289,12 @@ int main(int argc, char **argv)
     assert(trestle_adt_find(&adt, "/arm-io/avp-sealed-registers") !=
            TRESTLE_ADT_NO_NODE);
     assert(trestle_adt_find(&adt, "/arm-io/pvpanic") != TRESTLE_ADT_NO_NODE);
+    // ...and the buttons controller, which the bring-up machine has no window
+    // for but this platform does.
+    assert(trestle_adt_find(&adt, "/arm-io/pl061-buttons") !=
+           TRESTLE_ADT_NO_NODE);
+    assert(prop_u32(&adt, "/arm-io/pl061-buttons", "interrupt-parent") ==
+           TRESTLE_PHANDLE_GIC);
     assert(trestle_adt_find(&adt, "/chosen/lock-regs") != TRESTLE_ADT_NO_NODE);
     assert(prop_u32(&adt, "/arm-io/avp-rtc", "AAPL,phandle") ==
            TRESTLE_PHANDLE_AVP_RTC);

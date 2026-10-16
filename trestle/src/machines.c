@@ -81,11 +81,27 @@ static const trestle_machine_window g_qemu_windows[] = {
     // name             offset from soc_base   size     GIC interrupt id
     { "uart0",          0x01000000ull,         0x1000,  0 },
     { "pl031-rtc",      0x01010000ull,         0x1000,  0 },
-    // QEMU wires the PL061 to SPI 7, and XNU's "interrupts" cells are raw GIC
-    // ids, not SPI numbers: the architected PPI 7 that the cpu node publishes
-    // is 0x17 = 23, and the reference tree's 0x25 for this same controller is
-    // SPI 5.  So the id is 32 + 7.
-    { "pl061-buttons",  0x01030000ull,         0x1000,  39 },
+    // No "pl061-buttons" on this machine, and so no node for it in the tree.
+    //
+    // QEMU's own generated device tree still advertises pl061@9030000 with a
+    // gpio-keys child, but the machine never instantiates the controller: it is
+    // not a user-creatable device (-device pl061 is rejected), and "info mtree"
+    // shows nothing between pl031@0x09010000 and acpi-ged@0x09080000.  A window
+    // with no device behind it takes a synchronous external abort the first
+    // time it is touched, and something does touch it: AppleVirtualPlatform's
+    // GPIO driver binds to the node and writes GPIOIEV/GPIOIE (0x40c/0x410)
+    // while it starts.  XNU routes a kernel external abort to its
+    // implementation-specific-error handler, whose fallback reads IMPDEF
+    // syndrome registers QEMU leaves unallocated:
+    //
+    //   panic(cpu 0 caller 0xfffffe000a0899e8): Undefined kernel instruction:
+    //     pc=0xfffffe000a828b24 instr=d53ef008 @sleh.c:1930
+    //
+    // A node whose device no machine can back is worse than no node, so this
+    // description leaves it out the same way it leaves out avp-rtc and the rest
+    // of the AVP surface.  The AVP description below carries it, because the
+    // real platform has the controller; there XNU's "interrupts" cells are raw
+    // GIC ids, so the reference platform's SPI 5 is 0x25.
 };
 
 trestle_machine *trestle_machine_qemu_virt(void)

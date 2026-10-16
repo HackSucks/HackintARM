@@ -68,7 +68,7 @@ addresses, phandles and devices:
                     filesystems-props, buttons, port-virtual-1,
                     osenvironments, pmgr, chosen, defaults, product,
                     options, arm-io, cpus
-    /arm-io         gic, uart0, pl031-rtc, pl061-buttons
+    /arm-io         gic, uart0, pl031-rtc
     /chosen         the firmware policy properties plus the subnodes
                     memory-map, manifest-(object-)properties, iBoot,
                     secure-boot-hashes, boot-object-manifests,
@@ -130,13 +130,9 @@ GICR_SIZE = 0x20000
 # emulates them on the real machine.
 PL031_PHYS = 0x09010000            # PL031 RTC
 PL031_SIZE = 0x1000
-PL061_PHYS = 0x09030000            # PL061 GPIO controller (the buttons)
-PL061_SIZE = 0x1000
-# QEMU virt wires the PL061 to SPI 7, and XNU's "interrupts" cells are raw GIC
-# ids, not SPI numbers: the architected PPI 7 that the cpu node publishes is
-# 0x17 = 23 (= PPI 7 + 16), and the authentic tree's 0x25 for this same
-# controller is SPI 5.  So the id is 32 + 7.
-PL061_IRQ = 39
+# QEMU virt's device tree advertises a PL061 at 0x09030000 with a gpio-keys
+# child, but the machine does not instantiate the controller, so no node for it
+# is published here: see the note above /arm-io in build().
 
 TIMEBASE_HZ = 24000000             # architected timer frequency (QEMU virt)
 
@@ -172,6 +168,8 @@ PHANDLE_ARM_IO = 0x36
 PHANDLE_UART0 = 0x38
 PHANDLE_GIC = 0x39
 PHANDLE_PL031_RTC = 0x3D
+# Kept for the numbering, but not published by this machine: see the note above
+# /arm-io in build().  Trestle's AVP machine does carry the node.
 PHANDLE_PL061_BUTTONS = 0x40
 PHANDLE_PRAM = 0x44
 PHANDLE_VRAM = 0x45
@@ -530,18 +528,29 @@ def build():
         ("reg", u64(PL031_PHYS - SOC_BASE, PL031_SIZE)),
     )
 
-    # The buttons.  On the AVP these hang off a PL061 GPIO controller with
-    # role = "VMA1_BUTTONS"; QEMU virt has the same controller.
-    pl061_buttons = node(
-        "pl061-buttons",
-        ("compatible", s("ARM,pl061")),
-        ("role", s("VMA1_BUTTONS")),
-        ("interrupts", u32(PL061_IRQ, 0)),
-        ("interrupt-parent", u32(PHANDLE_GIC)),
-        ("AAPL,phandle", u32(PHANDLE_PL061_BUTTONS)),
-        ("reg", u64(PL061_PHYS - SOC_BASE, PL061_SIZE)),
-    )
-
+    # There is no PL061 button controller here.
+    #
+    # On the AVP the buttons hang off a PL061 GPIO controller with
+    # role = "VMA1_BUTTONS", and QEMU's *generated* device tree still advertises
+    # one ("pl061@9030000" with a gpio-keys child) -- but the machine never
+    # instantiates it: it is not a user-creatable device, and "info mtree"
+    # shows nothing between pl031@0x09010000 and acpi-ged@0x09080000.  A
+    # window with no device behind it takes a synchronous external abort the
+    # first time it is touched, and something does touch it: the AVP's GPIO
+    # driver binds to this node and writes GPIOIEV/GPIOIE (0x40c/0x410) when it
+    # starts.  XNU routes a kernel external abort to its
+    # implementation-specific-error handler, whose fallback (no platform
+    # handler is registered yet) reads IMPDEF syndrome registers that QEMU
+    # leaves unallocated, so the abort surfaces as:
+    #
+    #     panic(cpu 0 caller 0xfffffe000a0899e8): Undefined kernel instruction:
+    #       pc=0xfffffe000a828b24 instr=d53ef008 @sleh.c:1930
+    #
+    # A node whose device no machine can back is worse than no node, so this
+    # description leaves it out, the same way it leaves out avp-rtc, avp-ctrr,
+    # avp-sealed-registers and pvpanic.  Trestle's AVP machine (the
+    # real-hardware path) still carries it, with the reference platform's
+    # 0x10060000 window and SPI 5 (GIC id 0x25).
     arm_io = node(
         "arm-io",
         ("compatible", s("arm-io,vmapple1")),
@@ -558,7 +567,7 @@ def build():
         # third cell (the window size) is what iBoot publishes; 0 for the base
         # means "no SoC" and disables the serial console entirely.
         ("ranges", u64(0, SOC_BASE, SOC_SIZE)),
-        children=[gic, uart, pl031_rtc, pl061_buttons],
+        children=[gic, uart, pl031_rtc],
     )
 
     # ---------------------------------------------------------------------
