@@ -102,8 +102,13 @@ trestle_machine *trestle_machine_qemu_virt(void)
 
     m.gic_dist_offset = 0x00000000ull;
     m.gic_dist_size = 0x00010000ull;
+    // One 128 KiB redistributor frame per CPU: Apple's GICv3 driver refuses a
+    // region whose size is not a multiple of 128K (AppleARMGICv3.cpp:182), and
+    // this machine declares one CPU.  QEMU's own region covers its 123 possible
+    // vCPUs (0xF60000); describing just CPU 0's frame keeps every byte of the
+    // region backed by a real redistributor.
     m.gic_redist_offset = 0x000a0000ull;
-    m.gic_redist_size = 0x000f6000ull;
+    m.gic_redist_size = 0x00020000ull;
 
     m.windows = g_qemu_windows;
     m.window_count = TRESTLE_ARRAY_SIZE(g_qemu_windows);
@@ -160,6 +165,10 @@ trestle_machine *trestle_machine_avp(void)
 
     m.gic_dist_offset = 0x00000000ull;
     m.gic_dist_size = 0x01000000ull;
+    // The reference platform declares 32 CPUs, so its redistributor region is
+    // 32 * 128 KiB = 4 MiB (and therefore a multiple of 128K, as the driver
+    // requires).  A port that publishes a different CPU count has to scale
+    // this with it.
     m.gic_redist_offset = 0x00010000ull;
     m.gic_redist_size = 0x00400000ull;
 

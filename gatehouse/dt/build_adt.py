@@ -111,7 +111,17 @@ UART_SIZE = 0x1000
 GICD_PHYS = 0x08000000
 GICD_SIZE = 0x10000
 GICR_PHYS = 0x080A0000
-GICR_SIZE = 0x0F6000
+# The redistributor region is a run of 128 KiB frames, one per CPU, and
+# AppleARMGICv3.cpp:182 panics outright unless the size we publish is a
+# multiple of 128K:
+#
+#     "Redistributor region size is not multiple of 128K."
+#
+# The reference platform's tree follows the same rule (32 cpus * 0x20000 =
+# 0x400000), and so does QEMU, whose own region covers its 123 possible vCPUs
+# (0xF60000).  We describe exactly the CPUs we publish -- cpus=1 in the boot
+# arguments below -- so this is one frame.
+GICR_SIZE = 0x20000
 
 # The rest of QEMU virt's device window, from the machine's own DTB
 # (-M virt,dumpdtb=...).  The authentic VMApple platform carries the same two
