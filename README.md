@@ -1,21 +1,62 @@
 # HackintARM
-An attempt at reviving Hackintosh in the form of ARM64 laptops, given Apple's switch to purely Apple Sillicon for macOS 27
 
-# NOTICE
-I restarted from scratch. Attempt 1 ended around 3 months ago, after i completely burned out :<.
-This is attempt 2.
-This time, with new knowledge, i aim to get at the least UART working sooner.
+Reviving Hackintosh on ARM64 laptops, now that macOS 27+ is Apple Silicon only.
 
-This time it will be 2 parts, HackintARM as the project, Gatehouse being the name of the EFI application/bootloader that runs. this means it works on anything that has UEFI, and no more bare-metal bring up is needed. 
+---
 
-# Source?
-Soon, as soon as UART works.
+## Status
+
+**Late-stage boot.** The full kernelcache is booting again, and this is continents ahead of attempt 1.
+
+Right now the only blocker is a **root image**. Until the kernel has one to mount, it can't go any further.
+
+### Milestones
+- [x] UART/serial reached
+- [x] Kernelcache boots with all 236 kexts loaded
+- [x] Past `AppleImage4`'s `mpo_policy_init`
+- [x] Full KC booting into late-stage boot
+- [ ] Root image mounted
+- [ ] Userland
+
+---
+
+## Sub-projects
+
+HackintARM is an umbrella project made up of the following parts, all bridge themed:
+
+| Sub-project | What it is |
+|---|---|
+| **Gatehouse** | The EFI application/bootloader. It runs on anything with UEFI, so no bare-metal bring-up is needed. Its core work is done, and the focus has moved to Trestle. |
+| **Trestle** | A hypervisor that provides what VMApple's hypervisor did, but also doubles as a layer that **spoofs the real hardware** VMApple expects. It can also supply drivers where needed, ported from BSD or Linux source. **Officially started** |
+| **Lantern** *(upcoming)* | Handles translation from Paravirtual GPU device to the real hardware. |
+
+---
+
+## Tooling
+
+HackintARM will ship with all the tooling needed to:
+
+1. Fetch an **exact copy** of the kernelcache (KC) and the **AEA-encrypted root image** I use.
+2. **Decrypt** that AEA image.
+
+That way anyone can reproduce the exact setup without guessing at versions.
+
+---
+
+## Target
+
+macOS 27, using the **VMApple kernelcache**, since it makes far fewer platform assumptions than the bare-metal M-series ones.
+
+---
+
+## Requirements
+
+- An ARMv8.2/8.3+ SoC with **pointer authentication (pauth)**. SoCs without it are incompatible with HackintARM for now.
+- Support for **16K pages/4K page based processor that can HANDLE 16K pages.**.
+- UEFI firmware (for Gatehouse).
+
+---
 
 # ETA?
-Being optimistic, maybe 2 weeks for UART.
-
-# Target?
-macOS 27, using the vmapple kernelcache, as it does not have as many platform assumptions. 
-
-# Requirements?
-a ARMv8 SoC that provides pauth. any SoC without this is imcompatible with HackintARM for now.
+ETA to booting till late-stage is now.. done.
+ETA to fully working? could be many weeks.
