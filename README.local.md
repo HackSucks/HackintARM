@@ -78,10 +78,22 @@ Walls cleared so far:
   *"Redistributor region size is not multiple of 128K"* unless the tree
   publishes one whole 128 KiB frame per CPU (`GICR_SIZE`), not the region the
   firmware happens to reserve.
+* **Unbacked PL061 window** — the panic that followed was a *synchronous
+  external abort* on the button controller's `GPIOIEV`/`GPIOIE`, and the fix is
+  to not publish a node for a window the machine cannot back.
 
 Bring-up now runs the **whole IOKit matching phase**: 1122 personalities are
-sent, and every kext in the collection loads and starts (`AppleARMGIC`,
-`IOGraphicsFamily` is load tag 66, …). It then panics as BSD init begins:
+sent, every kext in the collection loads and starts (`AppleARMGIC`,
+`IOGraphicsFamily` is load tag 66, …), BSD init comes up (MAC Framework, AMFI
+developer mode) and the remaining kexts load through load tag 92 (apfs, nfs,
+tmpfs, ppp, l2tp) with NVRAM writes syncing. It then stops waiting for a root
+device:
+
+```
+Waiting on <dict ID="0"><key>IOProviderClass</key><string ID="1">IOMedia</string>…
+```
+
+Getting there took one diagnosis. The boot used to panic just after AMFI with
 
 ```
 panic(cpu 0 caller 0xfffffe000a0899e8): Undefined kernel instruction:
@@ -93,17 +105,38 @@ error handler** `arm64_implementation_specific_error` reads a bank of Apple
 IMPDEF syndrome registers (`S3_6_C15_C0_0`, `S3_3_C15_{C0,C8,C9,C10}_0`,
 `S3_4_C15_C0_0`). An Apple CPU implements those encodings; QEMU's `-cpu max`
 leaves them unallocated, so the read takes "unknown reason" and `sleh` panics.
+That reader is only the *fallback* of a dispatcher `sleh_synchronous`
+tail-calls for the trapped / implementation-defined exception classes: it first
+offers the exception to a global handler object and a per-thread handler, and
+neither is registered this early in the boot.
 
-That default reader is only the *fallback* of a dispatcher that
-`sleh_synchronous` tail-calls for the trapped / implementation-defined
-exception classes. The dispatcher first calls a **registered platform
-handler** — a global handler object (`[0xfffffe000ac5d048]`, method at vtable
-+`0x880`) and a per-thread handler at `thread+464` — and only falls back to the
-hard-coded register reader when neither is registered. Neither was registered
-in this boot, which is where the fix has to come from: the AVP's "sealed
-register" machinery (`AppleVirtualPlatformSealedRegisters`, the
-`avp-sealed-registers` / `avp-ctrr` nodes) is what installs it, and that
-surface is deliberately not described in the QEMU tree yet.
+The **root cause** is the exception it was trying to report. The first
+exception on the boot is a data abort — `ESR_EL1 = 0x96000050`, EC `0x25`,
+DFSC `0x10`, i.e. a synchronous external abort — from
+`AppleVirtualPlatform` at `pc 0xfffffe0008a92bd4`:
+
+```
+ldr  x8, [x19, #208]        ; the driver's mapped GPIO window
+mov  w9, #0x40
+strb w9, [x8, #1036]        ; GPIOIEV, offset 0x40c
+strb w9, [x8, #1040]        ; GPIOIE,  offset 0x410
+```
+
+That is the AVP's GPIO driver enabling the interrupt for line 6, and the window
+it writes to is a hole. QEMU's *generated* device tree advertises
+`pl061@9030000` with a `gpio-keys` child, but the machine never instantiates the
+controller — it is not a user-creatable device (`-device pl061` is rejected),
+and `info mtree` shows nothing between `pl031@0x09010000` and
+`acpi-ged@0x09080000`. Publishing the node tells a driver to map an address that
+no device backs, and its first register write aborts in the kernel.
+
+So the fix is a **machine-description** one: a node whose device no machine can
+back is worse than no node, and `build_adt.py` plus Trestle's QEMU machine
+(`g_qemu_windows`) leave it out the way they already leave out `avp-rtc`,
+`avp-ctrr`, `avp-sealed-registers` and `pvpanic`. Trestle's AVP description
+still carries the window (`0x10060000`, GIC id `0x25`) because the real platform
+has the controller, and the machine description is the only thing that differs
+between the two trees.
 
 The root volume itself is `043-70867-635.dmg.aea` in the IPSW. It is an AEA
 (profile 1) archive, but it is **not** device-bound: its auth data names a
@@ -112,5 +145,11 @@ Range-fetching it from Apple's CDN, producing a raw APFS container
 (`NXSB`, 13.21 GiB) — the raw block device macOS wants. See
 [`docs/ipsw.md`](docs/ipsw.md).
 
-The remaining platform devices (timers, GIC routing, the sealed-register and
-CTRR windows) are virtio/AAPL devices that Trestle is meant to emulate.
+Next is that root device. The decrypted volume is a raw APFS container
+(`NXSB`, 13.21 GiB) and can be handed to the guest as a block device, but XNU
+binds it through the platform's storage path: the AVP presents its virtio
+devices behind the `pcie` node (`pcie,vmappl1`, `#address-cells` = 3, a 28-byte
+`ranges`, `msi-frame-index` = 2, `interrupt-base` = 0x40), and that programming
+model has to be understood before any disk can be attached. The remaining
+platform devices (timers, GIC routing, the sealed-register and CTRR windows) are
+likewise virtio/AAPL devices that Trestle is meant to emulate.
