@@ -187,6 +187,52 @@ def reserved_manifest_properties():
 
 
 # ---------------------------------------------------------------------------
+# NVRAM.
+#
+# XNU's NVRAM path for this platform is IONVRAMCHRPHandler (see the CHRP
+# NVRAM constants in iokit/Kernel/IONVRAM.cpp).  It reads the image size from
+# the /chosen "nvram-total-size" property and the image itself from
+# "nvram-proxy-data" (initProxyData()/getNVRAMSize()/initNVRAMImage()):
+#
+#     struct chrp_nvram_header {          // 16 bytes, 16-byte aligned
+#         uint8_t  sig;                   // 0x70 = system, 0x71 = config
+#         uint8_t  cksum;                 // sum of the 16 header bytes == 0
+#         uint16_t len;                   // partition length in 16-byte blocks
+#         char     name[12];              // "system" / "common"
+#     };
+#
+# On a real machine iBoot writes the live image here.  Producing it is the
+# job of the platform NVRAM device model (Trestle; see trestle/src/nvram.c).
+# This is the bring-up stand-in: an empty but well-formed image with a
+# "system" and a "common" partition, both zeroed (a zeroed variable area
+# deserialises to an empty dictionary, i.e. factory defaults).
+# ---------------------------------------------------------------------------
+NVRAM_SIZE = 8192               # the size iBoot uses on Apple Silicon
+NVRAM_SYSTEM_SIZE = 1024        # bytes, multiple of 16
+NVRAM_COMMON_SIZE = NVRAM_SIZE - NVRAM_SYSTEM_SIZE
+
+
+def chrp_partition(sig, name, size):
+    """One CHRP NVRAM partition: 16-byte header + zeroed data area."""
+    total = ((size + 15) // 16) * 16            # data area, 16-byte aligned
+    header = bytearray(16)
+    header[0] = sig
+    header[2] = (total // 16) & 0xFF            # len, in 16-byte blocks
+    header[3] = ((total // 16) >> 8) & 0xFF
+    encoded = name.encode("ascii")
+    header[4:4 + len(encoded)] = encoded
+    header[1] = (-sum(header)) & 0xFF           # cksum: header sums to zero
+    return bytes(header) + bytes(total - 16)
+
+
+def nvram_proxy_data():
+    image = (chrp_partition(0x70, "system", NVRAM_SYSTEM_SIZE) +
+             chrp_partition(0x71, "common", NVRAM_COMMON_SIZE))
+    assert len(image) == NVRAM_SIZE, len(image)
+    return image
+
+
+# ---------------------------------------------------------------------------
 # The tree itself.  This is the "emulated Apple platform": the interface
 # between Gatehouse and XNU, and the only thing that has to change to move to a
 # different machine.
@@ -303,6 +349,9 @@ def build():
         ("kernel-ctrr-to-be-enabled", u32(0)),
         # check_for_panic_log() reads the size of the panic log from here.
         ("embedded-panic-log-size", u32(PANIC_SIZE)),
+        # IONVRAMCHRPHandler: size and image of the NVRAM store.
+        ("nvram-total-size", u32(NVRAM_SIZE)),
+        ("nvram-proxy-data", nvram_proxy_data()),
         children=[memory_map, manifest_props, asmb],
     )
 

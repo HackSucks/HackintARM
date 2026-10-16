@@ -7,6 +7,9 @@
 *.elf
 *.map
 
+# Trestle test binaries
+trestle/tests/nvram_test
+
 # Python
 __pycache__/
 *.pyc
