@@ -6,7 +6,7 @@ Reviving Hackintosh on ARM64 laptops, now that macOS 27+ is Apple Silicon only.
 
 ## Status
 
-**Late-stage boot.** The full kernelcache is booting again, and this is continents ahead of attempt 1.
+**Late-stage boot.** The full release, retail kernelcache is booting.
 
 Right now the only blocker is a **root image**. Until the kernel has one to mount, it can't go any further.
 
