@@ -77,9 +77,16 @@ Walls cleared so far:
 
 Bring-up now loads the full kext set (`AppleARMPlatform`,
 `AppleVirtualPlatform`, `AppleVirtIO*`, `IOTimeSyncFamily`, `IOgPTPPlugin`, …)
-with **no panic**. It then stalls in late service startup on repeated
-`Kext com.apple.driver.AppleARMPlatform is already loaded` — the stage right
-before it would go looking for a root volume to mount.
+with **no panic**, then goes quiet after the last kext, with the serial
+repeating `Kext com.apple.driver.AppleARMPlatform is already loaded`.
+
+Under GDB the guest is not faulted — it is executing, and the boot thread is
+inside `_thread_block` (the scheduler's block path) around a
+`mach_absolute_time`-style read of `CNTVCT_EL0` paired with a per-CPU timebase
+offset, with `CNTFRQ_EL0` = 1 GHz and the virtual timer armed
+(`CNTV_CTL_EL0` = 1). So it is waiting on time / a platform event rather than
+crashing, which is exactly where the remaining platform devices (NVRAM, timers,
+interrupt routing) and a root volume have to actually exist.
 
 The root volume itself is `043-70867-635.dmg.aea` in the IPSW. It is an AEA
 (profile 1) archive, but it is **not** device-bound: its auth data names a
