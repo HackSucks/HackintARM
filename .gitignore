@@ -1,0 +1,19 @@
+# Build outputs
+/build/
+*.o
+*.a
+*.EFI
+*.efi
+*.elf
+*.map
+
+# Python
+__pycache__/
+*.pyc
+
+# Extracted Apple images: copyrighted, not distributed (see LICENSING.md)
+/kernel/
+
+# QEMU / debugger scratch
+*.bin
+*.log
