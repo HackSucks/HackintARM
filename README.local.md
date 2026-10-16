@@ -74,19 +74,36 @@ Walls cleared so far:
 * **Platform expert** — the root nub is named from the device tree root's
   `compatible`; it must publish `AppleVirtualPlatformARM` so
   `AppleVirtualPlatformARMPE` matches.
+* **GICv3 redistributor** — `AppleARMGICv3.cpp:182` panics with
+  *"Redistributor region size is not multiple of 128K"* unless the tree
+  publishes one whole 128 KiB frame per CPU (`GICR_SIZE`), not the region the
+  firmware happens to reserve.
 
-Bring-up now loads the full kext set (`AppleARMPlatform`,
-`AppleVirtualPlatform`, `AppleVirtIO*`, `IOTimeSyncFamily`, `IOgPTPPlugin`, …)
-with **no panic**, then goes quiet after the last kext, with the serial
-repeating `Kext com.apple.driver.AppleARMPlatform is already loaded`.
+Bring-up now runs the **whole IOKit matching phase**: 1122 personalities are
+sent, and every kext in the collection loads and starts (`AppleARMGIC`,
+`IOGraphicsFamily` is load tag 66, …). It then panics as BSD init begins:
 
-Under GDB the guest is not faulted — it is executing, and the boot thread is
-inside `_thread_block` (the scheduler's block path) around a
-`mach_absolute_time`-style read of `CNTVCT_EL0` paired with a per-CPU timebase
-offset, with `CNTFRQ_EL0` = 1 GHz and the virtual timer armed
-(`CNTV_CTL_EL0` = 1). So it is waiting on time / a platform event rather than
-crashing, which is exactly where the remaining platform devices (NVRAM, timers,
-interrupt routing) and a root volume have to actually exist.
+```
+panic(cpu 0 caller 0xfffffe000a0899e8): Undefined kernel instruction:
+  pc=0xfffffe000a828b24 instr=d53ef008 @sleh.c:1930
+```
+
+`d53ef008` is `mrs x8, S3_6_C15_C0_0`: the **default implementation-specific
+error handler** `arm64_implementation_specific_error` reads a bank of Apple
+IMPDEF syndrome registers (`S3_6_C15_C0_0`, `S3_3_C15_{C0,C8,C9,C10}_0`,
+`S3_4_C15_C0_0`). An Apple CPU implements those encodings; QEMU's `-cpu max`
+leaves them unallocated, so the read takes "unknown reason" and `sleh` panics.
+
+That default reader is only the *fallback* of a dispatcher that
+`sleh_synchronous` tail-calls for the trapped / implementation-defined
+exception classes. The dispatcher first calls a **registered platform
+handler** — a global handler object (`[0xfffffe000ac5d048]`, method at vtable
++`0x880`) and a per-thread handler at `thread+464` — and only falls back to the
+hard-coded register reader when neither is registered. Neither was registered
+in this boot, which is where the fix has to come from: the AVP's "sealed
+register" machinery (`AppleVirtualPlatformSealedRegisters`, the
+`avp-sealed-registers` / `avp-ctrr` nodes) is what installs it, and that
+surface is deliberately not described in the QEMU tree yet.
 
 The root volume itself is `043-70867-635.dmg.aea` in the IPSW. It is an AEA
 (profile 1) archive, but it is **not** device-bound: its auth data names a
@@ -95,5 +112,5 @@ Range-fetching it from Apple's CDN, producing a raw APFS container
 (`NXSB`, 13.21 GiB) — the raw block device macOS wants. See
 [`docs/ipsw.md`](docs/ipsw.md).
 
-The remaining platform devices (NVRAM, timers, GIC routing) are virtio/AAPL
-devices that Trestle is meant to emulate.
+The remaining platform devices (timers, GIC routing, the sealed-register and
+CTRR windows) are virtio/AAPL devices that Trestle is meant to emulate.
