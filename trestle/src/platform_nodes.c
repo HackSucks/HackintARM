@@ -343,6 +343,12 @@ static trestle_status build_chosen(trestle_adt *adt, const trestle_machine *m)
     if (id != 0 && id->boot_args != 0)
         trestle_adt_set_string(adt, chosen, "boot-args", id->boot_args);
 
+    // IOKitBSDInit() reads this to find the root media: it waits for an IOMedia
+    // whose UUID is the volume it names.  A 36 character UUID string (the
+    // kernel copies at most 37 bytes).
+    if (id != 0 && id->boot_uuid != 0)
+        trestle_adt_set_string(adt, chosen, "boot-uuid", id->boot_uuid);
+
     // arm_init() panics unless both of these are present.
     trestle_adt_set_u64(adt, chosen, "dram-base", m->ram_base);
     trestle_adt_set_u64(adt, chosen, "dram-size", m->ram_size);

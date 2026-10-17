@@ -33,6 +33,12 @@ static const trestle_machine_identity g_identity = {
     .boot_args =
         "debug=0x14e -v -noprogress serial=1 cpus=1 kextlog=0xfff keepsyms=1 "
         "exe_boothash_salt=0",
+    // The bring-up root volume's APFS volume UUID (sat in the APSB of
+    // vmapple-rootfs).  iBoot reads the boot volume's UUID out of the boot
+    // policy and publishes it here; Gatehouse has no boot policy, so the machine
+    // states the volume it was told to boot.  Without it IOKitBSDInit never
+    // matches the media and the boot stops in the picker.
+    .boot_uuid = "20ED2DC7-B9F5-4DD3-8EE9-C6EF9AD3AD5A",
     .product_name = "Apple Virtual Machine 1",
     .unique_model = "VMA2MACOSAP",
     .fdr_product_type = "VirtualMac2,1",

@@ -806,6 +806,17 @@ def build():
         "chosen",
         ("AAPL,phandle", u32(PHANDLE_CHOSEN)),
         ("boot-args", s("debug=0x14e -v -noprogress serial=1 cpus=1 kextlog=0xfff keepsyms=1 exe_boothash_salt=0")),
+        # IOKitBSDInit() (IOKit/IOKitBSDInit.cpp) reads this to find the root
+        # media: it takes the UUID string here (at most 37 bytes) and waits for
+        # an IOMedia whose UUID matches it to publish the "boot-uuid-media"
+        # resource -- the media the kernel mounts as /.  When no media ever
+        # matches it writes "boot-picker-bringup-reason" to NVRAM and brings up
+        # the boot picker, which is where a boot with no boot-uuid stops.  iBoot
+        # sets this on a real machine; the authentic VMApple ADT template does
+        # not carry it because the firmware adds it at boot, so this is one of
+        # the machine-specific values.  It is the APFS *volume* UUID in the
+        # bring-up root volume's superblock (vmapple-rootfs), 36 characters.
+        ("boot-uuid", s("20ED2DC7-B9F5-4DD3-8EE9-C6EF9AD3AD5A")),
         # arm_init() panics unless both are present; u64, little-endian.
         ("dram-base", u64(RAM_BASE)),
         ("dram-size", u64(RAM_SIZE)),

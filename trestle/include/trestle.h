@@ -82,6 +82,15 @@ typedef struct {
     const char *time_stamp;
     // The kernel command line, published on /chosen.
     const char *boot_args;
+    // The UUID of the volume the machine boots from, published on /chosen as
+    // "boot-uuid".  This is a boot policy value rather than a property of the
+    // silicon: iBoot selects the boot volume and hands its UUID to the kernel,
+    // which is how IOKitBSDInit (IOKit/IOKitBSDInit.cpp) locates the root media
+    // -- it waits for an IOMedia whose UUID matches, and when none ever does it
+    // writes "boot-picker-bringup-reason" to NVRAM and parks in the boot
+    // picker.  A port supplies the UUID of whatever it boots from; a 36
+    // character string (the kernel truncates the value at 37 bytes).
+    const char *boot_uuid;
     // /product's identity; see the platform nodes.
     const char *product_name;
     const char *unique_model;

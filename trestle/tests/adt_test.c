@@ -175,6 +175,13 @@ static void check_platform_contract(trestle_adt *adt,
     v = prop(adt, "/chosen", "crypto-hash-method", &length);
     assert(v != 0 && strcmp((const char *)v, "sha2-384") == 0);
 
+    // IOKitBSDInit() locates the root media by this UUID; it must be the 36
+    // character string plus its NUL, because the kernel copies at most 37
+    // bytes and treats the value as a C string.
+    v = prop(adt, "/chosen", "boot-uuid", &length);
+    assert(v != 0 && length == 37);
+    assert(strcmp((const char *)v, "20ED2DC7-B9F5-4DD3-8EE9-C6EF9AD3AD5A") == 0);
+
     // The reserved tables keep their shape, which is what their consumers
     // read (they fill the slots in themselves).
     v = prop(adt, "/chosen/manifest-properties", "UnusedIntegerProperty19",
