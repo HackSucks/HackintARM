@@ -182,6 +182,11 @@ static void check_platform_contract(trestle_adt *adt,
     assert(v != 0 && length == 37);
     assert(strcmp((const char *)v, "20ED2DC7-B9F5-4DD3-8EE9-C6EF9AD3AD5A") == 0);
 
+    // The machine has no Preboot volume, so it must not claim one: a present
+    // apfs-preboot-uuid (even zero-filled) makes the apfs kext prefer it over
+    // boot-uuid and drop the boot media entirely.
+    assert(prop(adt, "/chosen", "apfs-preboot-uuid", &length) == 0);
+
     // The reserved tables keep their shape, which is what their consumers
     // read (they fill the slots in themselves).
     v = prop(adt, "/chosen/manifest-properties", "UnusedIntegerProperty19",

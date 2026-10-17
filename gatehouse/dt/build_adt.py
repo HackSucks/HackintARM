@@ -373,6 +373,16 @@ def reserved_memory_map_properties():
 #
 # One deliberate deviation: sepfw-load-at-boot is 0, not 1.  It tells the SEP
 # manager to load SEP firmware during boot, and this machine has no SEP.
+#
+# A second: apfs-preboot-uuid is absent rather than zero-filled.  iBoot fills
+# that property in with the boot volume group's Preboot volume UUID; this
+# machine boots a plain, ungrouped APFS volume, so there is no Preboot volume.
+# The zero-filled placeholder is worse than nothing -- AppleFileSystemDriver
+# (the apfs kext) prefers apfs-preboot-uuid over boot-uuid whenever the
+# property is present, and an all-zero value is not a parseable UUID, so the
+# driver gives up and never publishes "boot-uuid-media", which is the resource
+# IOKitBSDInit waits for.  Omitting it makes the driver fall through to
+# boot-uuid, which names the root volume directly.
 # ---------------------------------------------------------------------------
 CHOSEN_FIRMWARE_PROPERTIES = [
     ("mix-n-match-prevention-status", u32(0)),
@@ -429,7 +439,9 @@ CHOSEN_FIRMWARE_PROPERTIES = [
     ("display-scale", u32(0)),
     ("effective-security-mode-sep", u32(0)),
     ("certificate-production-status", u32(0)),
-    ("apfs-preboot-uuid", bytes(38)),
+    # apfs-preboot-uuid is deliberately absent; see the note on the chosen
+    # node below (the machine has no Preboot volume, and a present-but-zero
+    # placeholder makes the apfs kext ignore boot-uuid).
     ("darwinos-userspace-reboot", u32(0)),
     ("allowed-boot-args", s("trace,trace_wake,kperf,-x,-v,trm_enabled,trace_typefilter,nox86exec")),
     ("secureboot-certificate-format", s("x509")),

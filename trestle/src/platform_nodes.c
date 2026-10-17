@@ -307,7 +307,15 @@ static const blob_prop chosen_blobs[] = {
     { "bootp-response", 300 },
     { "cl4-entropy", 192 },
     { "firmware-version", 256 },
-    { "apfs-preboot-uuid", 38 },
+    // apfs-preboot-uuid is deliberately absent.  iBoot fills it in with the
+    // UUID of the boot volume group's Preboot volume; this machine boots a
+    // plain, ungrouped APFS volume, so there is no Preboot volume to name.
+    // Leaving the authentic template's zero-filled placeholder in place is
+    // worse than omitting it: AppleFileSystemDriver (the apfs kext) prefers
+    // this property over "boot-uuid" when it is present, and an all-zero value
+    // is not a parseable UUID, so it gives up on the boot UUID entirely and
+    // never publishes "boot-uuid-media".  Omitting it makes the driver fall
+    // through to "boot-uuid", which names the root volume directly.
     { "osenvironment", 32 },
     { "boot-manifest-hash", 48 },
 };
