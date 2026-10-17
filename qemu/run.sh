@@ -15,7 +15,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 GH="$ROOT/gatehouse"
 KERNEL="${KERNEL:-$ROOT/kernel/kernel.development.vmapple}"
 ESP="$ROOT/build/esp"
-MEM="${MEM:-4G}"
+MEM="${MEM:-3G}"
 CPU="${CPU:-max}"
 GDB_PORT="${GDB_PORT:-1234}"
 USE_GDB="${GDB:-1}"
@@ -59,7 +59,22 @@ QARGS=(
   # window, which is what lets the guest resolve the node to IODeviceMemory at
   # all; it also matches the reference platform, whose ECAM is low
   # (0x40000000).  See PCIE_ECAM_PHYS in gatehouse/dt/build_adt.py.
-  -M virt,gic-version=3,highmem-ecam=off
+  #
+  # highmem=off removes QEMU's 64-bit PCI MMIO aperture (0x8000000000..).
+  # Without it, UEFI allocates the modern virtio BAR (BAR4: 64-bit
+  # prefetchable, 16 KB, and the only place a modern-only virtio device puts
+  # its common/notify/device config) up in that aperture, where nothing in the
+  # guest's tree describes it: the AVP's /arm-io/pcie carries a single 32-bit
+  # "ranges" entry because Apple's own PCIe devices are 32-bit only.  XNU then
+  # has no IODeviceMemory for the virtio transport, the transport never brings
+  # up AppleVirtIOBlock, no IOMedia appears and the kernel sits in the boot
+  # picker waiting for a root.  With the aperture gone, UEFI falls back to
+  # placing 64-bit BARs inside the 32-bit window (0x10000000..0x13ff0000),
+  # which our "ranges" already describes.  The price is the RAM above 4G:
+  # highmem=off leaves 3G at 0x40000000..0x100000000, and MEM + the
+  # dram-base/dram-size in gatehouse/dt/build_adt.py (and trestle's QEMU
+  # machine description) have to agree on that.
+  -M virt,gic-version=3,highmem-ecam=off,highmem=off
   -cpu "$CPU"
   -m "$MEM"
   -bios "$FW_CODE"

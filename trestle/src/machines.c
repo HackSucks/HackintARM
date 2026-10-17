@@ -130,7 +130,7 @@ trestle_machine *trestle_machine_qemu_virt(void)
     machine_seed_once();
 
     m.ram_base = 0x40000000ull;
-    m.ram_size = 0x100000000ull;        // MEM=4G in qemu/run.sh
+    m.ram_size = 0xC0000000ull;         // MEM=3G + highmem=off in qemu/run.sh
 
     m.soc_base = 0x08000000ull;         // QEMU virt's GIC base
     m.soc_size = 0x38000000ull;         // up to the RAM base: the /arm-io window
