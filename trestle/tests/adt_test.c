@@ -115,10 +115,15 @@ static void check_platform_contract(trestle_adt *adt,
     v = prop(adt, "/arm-io/uart0", "reg", &length);
     assert(v != 0 && length == 16);
 
-    // pe_init_fiq() requires exactly GICD then GICR in a 32-byte "reg", and
-    // every interrupt-parent has to name it.
+    // pe_init_fiq() requires exactly GICD then GICR in the first 32 bytes of
+    // "reg", and every interrupt-parent has to name it.  A machine with a
+    // message-based-interrupt frame appends it as the third region, which is
+    // what /arm-io/pcie "msi-frame-index" selects.
     v = prop(adt, "/arm-io/gic", "reg", &length);
-    assert(v != 0 && length == 32);
+    assert(v != 0 &&
+           (length == 32 ||
+            (length == 48 &&
+             trestle_machine_find_window(m, "gic-msi-frame") != 0)));
     assert(prop_u32(adt, "/arm-io/gic", "AAPL,phandle") == TRESTLE_PHANDLE_GIC);
     assert(prop_u32(adt, "/cpus/cpu0", "interrupt-parent") ==
            TRESTLE_PHANDLE_GIC);
@@ -198,6 +203,8 @@ static void check_machine_specific(trestle_adt *adt,
                                    const trestle_machine *m)
 {
     const trestle_machine_window *w;
+    const u8 *v;
+    usize length;
 
     assert(strcmp(m->identity->model, "VirtualMac2,1") == 0);
     assert(prop_u64(adt, "/arm-io/pl031-rtc", "reg") != 0);
@@ -215,6 +222,46 @@ static void check_machine_specific(trestle_adt *adt,
     } else {
         assert(trestle_adt_find(adt, "/arm-io/pl061-buttons") ==
                TRESTLE_ADT_NO_NODE);
+    }
+
+    // The PCIe host bridge is what the root disk is behind, and the guest's
+    // AppleVirtualPlatformPCIE only binds to a /arm-io child that looks like
+    // the reference one: "pcie,vmapple1", an ECAM in "reg", a decode window in
+    // "ranges", a raw-GIC-id INTx base in "interrupt-base" and a resolvable
+    // "device-interrupt-parent".  It is described on every machine that has a
+    // bridge window, because a tree that lacks it never enumerates the bus and
+    // the kernel parks waiting for a root IOMedia.
+    w = trestle_machine_find_window(m, "pcie");
+    if (w != 0) {
+        assert(trestle_adt_find(adt, "/arm-io/pcie") != TRESTLE_ADT_NO_NODE);
+        assert(prop_u32(adt, "/arm-io/pcie", "AAPL,phandle") ==
+               TRESTLE_PHANDLE_PCIE);
+        assert(prop_u32(adt, "/arm-io/pcie", "#address-cells") == 3);
+        assert(prop_u32(adt, "/arm-io/pcie", "#size-cells") == 2);
+        assert(prop_u32(adt, "/arm-io/pcie", "device-interrupt-parent") ==
+               TRESTLE_PHANDLE_GIC);
+        assert(prop_u32(adt, "/arm-io/pcie", "interrupt-base") == w->irq);
+        v = prop(adt, "/arm-io/pcie", "reg", &length);
+        assert(v != 0 && length == 16);
+        // <child address: 3, parent address: 2, size: 2> in the ADT's native
+        // cell encoding, and the CPU side is SoC-relative like "reg".
+        v = prop(adt, "/arm-io/pcie", "ranges", &length);
+        assert(v != 0 && length == 28);
+        assert(prop_u64(adt, "/arm-io/pcie", "reg") == w->offset);
+    } else {
+        assert(trestle_adt_find(adt, "/arm-io/pcie") == TRESTLE_ADT_NO_NODE);
+    }
+
+    // A message-based-interrupt frame exists only where the machine backs one.
+    // Without it the node carries no "msi-frame-index" and the virtio
+    // transport has to fall back to INTx -- which is what QEMU virt does, and
+    // what QEMU's own vmapple machine does too.
+    if (trestle_machine_find_window(m, "gic-msi-frame") != 0) {
+        assert(prop_u32(adt, "/arm-io/pcie", "msi-frame-index") == 2);
+        v = prop(adt, "/arm-io/gic", "reg", &length);
+        assert(v != 0 && length == 48);
+    } else if (w != 0) {
+        assert(prop(adt, "/arm-io/gic", "reg", &length) != 0 && length == 32);
     }
 }
 

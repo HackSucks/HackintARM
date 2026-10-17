@@ -18,7 +18,7 @@ CFLAGS  := $(TARGETFLAGS) -ffreestanding -fno-stack-protector -fno-builtin \
 
 SRCS := src/main.c src/boot.c src/adt.c src/machines.c src/platform.c \
         src/platform_nodes.c src/nvram.c src/rtc.c src/pmgr.c src/panic.c \
-        src/aprr.c
+        src/aprr.c src/pcie.c
 OBJS := $(SRCS:.c=.o)
 HDRS := $(wildcard include/*.h)
 
@@ -26,7 +26,7 @@ HDRS := $(wildcard include/*.h)
 # which is what the model tests link.
 MODEL_SRCS := src/boot.c src/adt.c src/machines.c src/platform.c \
               src/platform_nodes.c src/nvram.c src/rtc.c src/pmgr.c \
-              src/panic.c src/aprr.c
+              src/panic.c src/aprr.c src/pcie.c
 
 .PHONY: all clean test
 all: $(LIB)

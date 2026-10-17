@@ -13,6 +13,7 @@
 #include "aprr.h"
 #include "nvram.h"
 #include "panic.h"
+#include "pcie.h"
 #include "platform_nodes.h"
 #include "pmgr.h"
 #include "rtc.h"
@@ -27,6 +28,7 @@ static trestle_rtc   g_rtc;
 static trestle_pmgr  g_pmgr;
 static trestle_panic g_panic;
 static trestle_aprr  g_aprr;
+static trestle_pcie  g_pcie;
 
 static const trestle_device *g_devices[8];
 
@@ -73,6 +75,9 @@ trestle_status trestle_boot_platform(const trestle_machine *machine,
     st = trestle_aprr_install(&g_aprr);
     if (st != TRESTLE_OK)
         return st;
+    st = trestle_pcie_install(&g_pcie);
+    if (st != TRESTLE_OK)
+        return st;
 
     st = trestle_platform_init(&platform, machine, g_devices,
                                TRESTLE_ARRAY_SIZE(g_devices));
@@ -83,7 +88,8 @@ trestle_status trestle_boot_platform(const trestle_machine *machine,
         (st = register_device(&platform, &g_rtc.device)) != TRESTLE_OK ||
         (st = register_device(&platform, &g_pmgr.device)) != TRESTLE_OK ||
         (st = register_device(&platform, &g_panic.device)) != TRESTLE_OK ||
-        (st = register_device(&platform, &g_aprr.device)) != TRESTLE_OK) {
+        (st = register_device(&platform, &g_aprr.device)) != TRESTLE_OK ||
+        (st = register_device(&platform, &g_pcie.device)) != TRESTLE_OK) {
         return st;
     }
 

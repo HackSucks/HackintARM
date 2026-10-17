@@ -699,13 +699,27 @@ static trestle_status build_arm_io(trestle_adt *adt, const trestle_machine *m)
     trestle_adt_set_u32(adt, node, "#address-cells", 0);
     trestle_adt_set_u32(adt, node, "AAPL,phandle", TRESTLE_PHANDLE_GIC);
     {
-        u64 reg[4];
+        // pe_init_fiq() maps exactly these two regions; the third is the
+        // machine's message-based-interrupt frame, where it has one.  A
+        // GICv2m-shaped window (a write of the SPI number to frame+0x40) is
+        // what the AVP's PCIe MSI path uses and what "msi-frame-index" on
+        // /arm-io/pcie selects, so a machine that provides the frame publishes
+        // it here and the port has to back it.
+        const trestle_machine_window *w =
+            trestle_machine_find_window(m, "gic-msi-frame");
+        u64 reg[6];
 
         reg[0] = m->gic_dist_offset;
         reg[1] = m->gic_dist_size;
         reg[2] = m->gic_redist_offset;
         reg[3] = m->gic_redist_size;
-        trestle_adt_set_u64v(adt, node, "reg", reg, 4);
+        if (w != 0) {
+            reg[4] = w->offset;
+            reg[5] = w->size;
+            trestle_adt_set_u64v(adt, node, "reg", reg, 6);
+        } else {
+            trestle_adt_set_u64v(adt, node, "reg", reg, 4);
+        }
     }
 
     // The console.  pe_serial.c resolves /defaults "serial-device" through

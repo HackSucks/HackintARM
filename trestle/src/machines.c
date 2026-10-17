@@ -102,6 +102,25 @@ static const trestle_machine_window g_qemu_windows[] = {
     // of the AVP surface.  The AVP description below carries it, because the
     // real platform has the controller; there XNU's "interrupts" cells are raw
     // GIC ids, so the reference platform's SPI 5 is 0x25.
+    //
+    // The PCIe host bridge is the opposite case: this machine does have one
+    // (GPEX), and it is where the root disk is.  "pcie" is its ECAM, "pcie-mmio"
+    // the CPU window its bus decodes to, and the window's irq is the first raw
+    // GIC id of the bridge's INTx lines -- QEMU wires INTx to SPI 3..6, and
+    // XNU's ids are raw, so the base is 35.  No "gic-msi-frame": QEMU virt's
+    // MSI goes through an ITS, which the guest's AVP-shaped GIC driver does not
+    // drive, so the node publishes no msi-frame-index and the virtio transport
+    // falls back to INTx (as it does on QEMU's own vmapple machine, which has
+    // no MSI frame either).
+    //
+    // The ECAM offset is the machine's low one (0x3f000000, highmem-ecam=off).
+    // It has to fall inside the SoC window, because the platform resolves a
+    // device's "reg" through the parent chain and a device outside every
+    // window gets no IODeviceMemory at all -- AppleVirtualPlatformPCIE::start()
+    // then panics on "fEcamMM != NULL".  SoC-relative that is 0x37000000,
+    // under the 0x38000000 window the machine description publishes.
+    { "pcie",           0x37000000ull,         0x1000000ull,  35 },
+    { "pcie-mmio",      0x08000000ull,         0x2eff0000ull, 0 },
 };
 
 trestle_machine *trestle_machine_qemu_virt(void)
@@ -160,6 +179,15 @@ static const trestle_machine_window g_avp_windows[] = {
     { "avp-rtc",              0x20240000ull, 0x1000,  0x33 },
     { "avp-ctrr",             0x20260000ull, 0x100,   0 },
     { "avp-sealed-registers", 0x20270000ull, 0x100,   0 },
+    // The PCIe host bridge and the GIC's MSI frame.  The reference tree's
+    // ECAM is 0x40000000 and its bus decodes 0x50000000 (hence the offsets
+    // from the AVP's 0x10000000 SoC base), and its first INTx line is raw GIC
+    // id 0x40.  The MSI frame is the GIC's third "reg" region: message-based
+    // interrupts on this platform are a write of the SPI number to
+    // frame+0x40, GICv2m-shaped, and "msi-frame-index" selects it.
+    { "pcie",                 0x30000000ull, 0x10000000ull, 0x40 },
+    { "pcie-mmio",            0x40000000ull, 0x2fff0000ull, 0 },
+    { "gic-msi-frame",        0x0fff0000ull, 0x10000ull,   0 },
 };
 
 trestle_machine *trestle_machine_avp(void)

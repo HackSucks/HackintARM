@@ -68,7 +68,7 @@ addresses, phandles and devices:
                     filesystems-props, buttons, port-virtual-1,
                     osenvironments, pmgr, chosen, defaults, product,
                     options, arm-io, cpus
-    /arm-io         gic, uart0, pl031-rtc
+    /arm-io         gic, uart0, pl031-rtc, pcie
     /chosen         the firmware policy properties plus the subnodes
                     memory-map, manifest-(object-)properties, iBoot,
                     secure-boot-hashes, boot-object-manifests,
@@ -96,6 +96,14 @@ import sys
 # keeps every device offset positive while staying a real address.
 # ---------------------------------------------------------------------------
 SOC_BASE = 0x08000000              # gPESoCBasePhys: QEMU virt GIC base
+# /arm-io ranges: child 0 -> parent SOC_BASE, and the window is what makes a
+# device address resolvable at all.  The platform resolves a child's "reg"
+# through the parent chain (IODTResolveAddressCell(), iokit/Kernel/
+# IODeviceTreeSupport.cpp): each level must find the address inside one of its
+# "ranges" windows, and a node whose address falls outside every window ends up
+# with no IODeviceMemory at all.  So every "reg" offset below has to be <
+# SOC_SIZE, and for a bus whose window the guest sizes itself (see PCIe below)
+# that constrains where the machine may put it.
 SOC_SIZE = 0x38000000              # /arm-io ranges: 0x08000000..0x40000000
 
 UART_PHYS = 0x09000000             # QEMU virt PL011
@@ -125,11 +133,56 @@ GICR_SIZE = 0x20000
 
 # The rest of QEMU virt's device window, from the machine's own DTB
 # (-M virt,dumpdtb=...).  The authentic VMApple platform carries the same two
-# devices; its *paravirtual* devices (avp-rtc, avp-ctrr, avp-sealed-registers,
-# pvpanic, pcie, aes, ...) have no QEMU backing and are left to Trestle, which
-# emulates them on the real machine.
+# devices; its other *paravirtual* devices (avp-rtc, avp-ctrr,
+# avp-sealed-registers, pvpanic, aes, ...) have no QEMU backing and are left to
+# Trestle, which emulates them on the real machine.
 PL031_PHYS = 0x09010000            # PL031 RTC
 PL031_SIZE = 0x1000
+
+# QEMU virt's PCIe host bridge (hw/pci-host/gpex.c + hw/arm/virt.c).  This one
+# *is* backed, and it is how the root disk attaches: XNU's storage stack is
+# AppleVirtIOStorageDevice behind AppleVirtIOTransport, whose PCI transport
+# matches the generic virtio vendor (AppleVirtIOBlock carries
+# IOVirtIOPrimaryMatch = 0x00021af4, i.e. virtio device type 2 vendor 0x1af4),
+# so a plain QEMU virtio-blk-pci is the right device.  The AVP's own root disk
+# is the same concept dressed in Apple's PCI ids (106b:1a00), which this QEMU
+# has no device for; see trestle/include/pcie.h for the whole path.
+#
+# The host bridge node below reproduces the authentic /arm-io/pcie (13
+# properties) with this machine's addresses.  Its own register window is the
+# ECAM, and "ranges" carries the CPU-side MMIO window:
+#
+#     reg            -> ECAM                  (QEMU: hw/arm/virt.c memmap)
+#     ranges[0]      -> MMIO32 PCI 0x10000000 -> CPU 0x10000000, 0x2eff0000
+#     interrupt-base -> first INTx GIC id      (QEMU: SPI 3..6 => ids 35..38)
+#
+# The ECAM is the low one (QEMU virt places it at 0x3f000000 with
+# highmem-ecam=off: 16 MB, 16 buses) and that is what the machine is launched
+# with.  It has to be low, and inside /arm-io "ranges": with the default
+# 0x4010000000 ECAM the node's offset (0x4008000000) is far outside the
+# 0x38000000-byte SoC window, IODTResolveAddressing() publishes an empty
+# IODeviceMemory array, and AppleVirtualPlatformPCIE::start() panics with
+#
+#     AppleVirtualPlatformPCIE.cpp:34 Assertion failed: fEcamMM != NULL
+#
+# Low is also the faithful choice: the AVP's ECAM is physical 0x40000000.
+PCIE_ECAM_PHYS = 0x3F000000         # QEMU virt: low ECAM (highmem-ecam=off)
+PCIE_ECAM_SIZE = 0x01000000         # 16 MB: 16 buses of 1 MB
+PCIE_MMIO_PCI_BASE = 0x10000000    # PCI side of the 32-bit MMIO window
+PCIE_MMIO_CPU_BASE = 0x10000000    # ... and its CPU side (identity mapped)
+PCIE_MMIO_SIZE = 0x2eff0000
+# INTx pin 0 of device 0 is GIC id 35 (SPI 3); gpex swizzles (dev + pin) % 4.
+# The AVP publishes 0x40 here because its first INTx is raw GIC id 0x40, which
+# is exactly what QEMU's own vmapple wires (irqmap[VMAPPLE_PCIE] = 0x20 SPI).
+PCIE_INTX_BASE = 35
+# msi-frame-index is deliberately *not* published: the AVP's MSI frame is a
+# GICv2m-shaped window at the GIC's third reg entry, and QEMU virt has no such
+# device (its MSI goes through an ITS, which the guest's GIC driver -- built
+# for the AVP -- does not drive).  Without the property the driver's
+# AppleVirtualPlatformPCIEMSIController maps the GIC's first region instead, so
+# MSI messages go nowhere; the virtio transport then uses INTx, exactly as it
+# does on QEMU's own vmapple, which has no MSI frame either (its
+# vmapple_compat_defaults exist because "there is no MSI(-X) support").
 # QEMU virt's device tree advertises a PL061 at 0x09030000 with a gpio-keys
 # child, but the machine does not instantiate the controller, so no node for it
 # is published here: see the note above /arm-io in build().
@@ -168,6 +221,7 @@ PHANDLE_ARM_IO = 0x36
 PHANDLE_UART0 = 0x38
 PHANDLE_GIC = 0x39
 PHANDLE_PL031_RTC = 0x3D
+PHANDLE_PCIE = 0x3F
 # Kept for the numbering, but not published by this machine: see the note above
 # /arm-io in build().  Trestle's AVP machine does carry the node.
 PHANDLE_PL061_BUTTONS = 0x40
@@ -551,6 +605,48 @@ def build():
     # avp-sealed-registers and pvpanic.  Trestle's AVP machine (the
     # real-hardware path) still carries it, with the reference platform's
     # 0x10060000 window and SPI 5 (GIC id 0x25).
+    #
+    # The PCIe host bridge is the opposite case: QEMU virt does back one, the
+    # AVP driver matches it through "pcie,vmapple1", and the root disk is
+    # behind it, so it is published.  What does not exist here is the MSI
+    # frame, which is why msi-frame-index is absent (see PCIE_INTX_BASE above);
+    # INTx and the ECAM are ordinary GPEX, so the only device that has to work
+    # over INTx is the virtio transport, which is what QEMU's own vmapple does
+    # too.
+    pcie = node(
+        "pcie",
+        ("compatible", s("pcie,vmapple1")),
+        ("device_type", s("pci")),
+        ("AAPL,phandle", u32(PHANDLE_PCIE)),
+        # A PCI child address is <phys.hi phys.mid phys.lo>; the AVP publishes
+        # 3 address cells and 2 size cells, and the bridge is a standard GPEX.
+        ("#address-cells", u32(3)),
+        ("#size-cells", u32(2)),
+        # The reference platform has nine root ports, so its bus range is 0..8;
+        # QEMU virt exposes a single bus, and a config read for an absent bus
+        # returns all ones, so the same range is both faithful and harmless.
+        ("bus-range", u32(0, 8)),
+        ("dev-range", u32(0, 0xFF)),
+        # reg is <offset, size> from the SoC base, the same convention as the
+        # GIC and uart nodes; this machine puts the ECAM below 4 GB so that it
+        # lands inside /arm-io "ranges" (see PCIE_ECAM_PHYS above).
+        ("reg", u64(PCIE_ECAM_PHYS - SOC_BASE, PCIE_ECAM_SIZE)),
+        # ranges is the standard <child address: 3, parent address: 2, size: 2>
+        # cell group, in the ADT's native (little-endian) cell encoding.  The
+        # CPU-side address is SoC-relative like every other address in this
+        # table: the authentic AVP node says PCI 0x50000000 -> CPU 0x40000000
+        # with the SoC base at 0x10000000, which is the identity mapping QEMU's
+        # vmapple implements (and gets right against the same ADT).
+        ("ranges", u32(0x02000000,
+                       PCIE_MMIO_PCI_BASE, 0,
+                       PCIE_MMIO_CPU_BASE - SOC_BASE, 0,
+                       PCIE_MMIO_SIZE, 0)),
+        # XNU's "interrupts" cells are raw GIC ids, so the INTx base is a raw
+        # id too: SPI 3 is GIC id 35.
+        ("interrupt-base", u32(PCIE_INTX_BASE)),
+        ("device-interrupt-parent", u32(PHANDLE_GIC)),
+    )
+
     arm_io = node(
         "arm-io",
         ("compatible", s("arm-io,vmapple1")),
@@ -567,7 +663,7 @@ def build():
         # third cell (the window size) is what iBoot publishes; 0 for the base
         # means "no SoC" and disables the serial console entirely.
         ("ranges", u64(0, SOC_BASE, SOC_SIZE)),
-        children=[gic, uart, pl031_rtc],
+        children=[gic, uart, pl031_rtc, pcie],
     )
 
     # ---------------------------------------------------------------------
