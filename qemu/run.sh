@@ -18,7 +18,13 @@ ESP="$ROOT/build/esp"
 MEM="${MEM:-3G}"
 CPU="${CPU:-max}"
 GDB_PORT="${GDB_PORT:-1234}"
-USE_GDB="${GDB:-1}"
+# The GDB stub is opt-in.  Runs launched with it (GDB=1) have repeatedly been
+# observed to park the vCPU thread under TCG -- guest PC somewhere in early
+# boot, thread in state S, utime/stime frozen for minutes, so the boot only
+# appears to hang -- while identical runs without it boot straight through.
+# Nothing needs the stub unless a debugger is actually going to attach, so the
+# default is off.  Use GDB=1 GDB_PORT=1234 ... when you want to connect.
+USE_GDB="${GDB:-0}"
 EXTRA=("$@")
 
 # The root volume, as a raw block device.  XNU's storage stack is
