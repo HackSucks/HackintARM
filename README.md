@@ -6,16 +6,30 @@ Reviving Hackintosh on ARM64 laptops, now that macOS 27+ is Apple Silicon only.
 
 ## Status
 
-**Late-stage boot.** The full release, retail kernelcache is booting.
+**Late-stage boot.** The full release, retail kernelcache is booting and the
+root volume mounts.
 
-Right now the only blocker is a **root image**. Until the kernel has one to mount, it can't go any further.
+The blocker is now post-mount: the kernel goes idle in `wfi` after the root
+volume is mounted, waiting on something that never arrives.
+
+Reaching the root volume needed one kernel-collection workaround (see
+`tools/kc_patch.py`). macOS 27's `IOPCIDevice::extendedFindPCICapability()`
+answers vendor-capability lookups out of a per-device capability dictionary
+built by `IOPCIBridge::constructCapabilitiesDict()`. A virtio-pci device
+exposes five capabilities that all share capability ID `0x09`, so that
+dictionary collapses to a single entry and the fast path hands back the same
+capability for every offset. `AppleVirtIOPCITransport::start()` walks vendor
+capabilities with `extendedFindPCICapability(9, &offset)` until it reports none
+left — which never happens — so it spun forever and no root media appeared.
+`tools/kc_patch.py` forces the reference config-space search; `qemu/run.sh`
+applies it to the staged kernel copy, leaving `kernel/` pristine.
 
 ### Milestones
 - [x] UART/serial reached
 - [x] Kernelcache boots with all 236 kexts loaded
 - [x] Past `AppleImage4`'s `mpo_policy_init`
 - [x] Full KC booting into late-stage boot
-- [ ] Root image mounted
+- [x] Root transport starts, root media appears and the APFS volume mounts
 - [ ] Userland
 
 ---
@@ -27,7 +41,7 @@ HackintARM is an umbrella project made up of the following parts, all bridge the
 | Sub-project | What it is |
 |---|---|
 | **Gatehouse** | The EFI application/bootloader. It runs on anything with UEFI, so no bare-metal bring-up is needed. Its core work is done, and the focus has moved to Trestle. |
-| **Trestle** | A hypervisor that provides what VMApple's hypervisor did, but also doubles as a layer that **spoofs the real hardware** VMApple expects. It can also supply drivers where needed, ported from BSD or Linux source. **Officially started** |
+| **Trestle** | A hypervisor that provides what VMApple's hypervisor did, but also doubles as a layer that **spoofs the real hardware** VMApple expects. It can also supply drivers where needed, ported from BSD or Linux source. |
 | **Lantern** *(upcoming)* | Handles translation from Paravirtual GPU device to the real hardware. |
 
 ---
