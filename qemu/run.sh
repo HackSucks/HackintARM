@@ -67,9 +67,6 @@ mkdir -p "$ESP/EFI/BOOT" "$ESP/gatehouse"
 cp "$GH/BOOTAA64.EFI" "$ESP/EFI/BOOT/BOOTAA64.EFI"
 cp "$KERNEL" "$ESP/gatehouse/kernel"
 cp "$ROOT/build/gatehouse.adt" "$ESP/gatehouse/gatehouse.adt"
-# Apply the documented bring-up workarounds to the staged copy only, so kernel/
-# stays pristine.  tools/kc_patch.py says what each patch is and why.
-python3 "$ROOT/tools/kc_patch.py" "$ESP/gatehouse/kernel"
 ls -l "$ESP/EFI/BOOT/BOOTAA64.EFI" "$ESP/gatehouse/"
 
 # XNU's pe_fiq.c is a GICv3 driver: pe_init_fiq() maps /arm-io/gic's GICD and

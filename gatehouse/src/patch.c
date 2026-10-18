@@ -131,12 +131,73 @@ static int patch_apple_key_hypercalls(u8 *img, u64 span)
 	return applied;
 }
 
+/*
+ * IOPCIDevice::extendedFindPCICapability() capability-search fast path.
+ *
+ * macOS 27 answers PCI capability lookups for a device out of a per-device
+ * capability dictionary that IOPCIBridge::constructCapabilitiesDict() builds.
+ * The dictionary is keyed by capability *symbol*, and every capability a
+ * virtio-pci device exposes shares one symbol -- all five carry capability ID
+ * 0x09 (common / notify / isr / device / pci-cfg) -- so the dictionary collapses
+ * to a single entry and the fast path hands back the same capability whatever
+ * offset it is given.  AppleVirtIOPCITransport::start() walks a device's vendor
+ * capabilities with extendedFindPCICapability(9, &offset) until the call
+ * reports none left, so the walk never terminates: the transport never
+ * registers, no IOMedia appears and there is no root device.
+ *
+ * This is not specific to virtio, nor to any machine -- any device that exposes
+ * more than one capability with the same ID trips it -- so the deviation lives
+ * here, in the loader, and every target gets it.
+ *
+ * The site is three instructions:
+ *
+ *	ldr	x8, [x21, #160]		; IOPCIDevice::reserved
+ *	ldr	x9, [x8, #472]		; reserved->capability dictionary (may be NULL)
+ *	cbz	x9, <search>		; no dictionary: take the reference search
+ *
+ * Replacing the conditional branch with an unconditional one sends every
+ * lookup through the reference config-space search -- the path Apple itself
+ * takes whenever the dictionary is absent -- which walks the PCI capability
+ * list in config space, iterates correctly and terminates.
+ */
+static int patch_apple_pci_capability_search(u8 *img, u64 span)
+{
+	static const u32 site[] = { 0xf94052a8u, 0xf940ed09u };
+	u64 off = find_pattern(img, span, site, 2);
+	u32 cbz, imm;
+
+	if (off == (u64)-1) {
+		return 0;
+	}
+	/* The next instruction must be "cbz x9, <search>". */
+	cbz = rd32(img + off + 8);
+	if ((cbz & 0xff00001fu) != 0xb4000009u) {
+		return 0;
+	}
+	/*
+	 * cbz reaches +/-1 MiB with a 19-bit immediate and b reaches +/-128 MiB
+	 * with a 26-bit one, both scaled by 4 and measured from the same
+	 * address, so the branch displacement carries over unchanged.
+	 */
+	imm = (cbz >> 5) & 0x7ffffu;
+	if (imm & 0x40000u) {
+		imm |= 0xfff80000u;			/* sign-extend 19 -> 32 */
+	}
+	wr32(img + off + 8, 0x14000000u | (imm & 0x03ffffffu));	/* b <search> */
+	gh_loghex("PCI capability search on the reference path: ", 1);
+
+	return 1;
+}
+
 int gh_patch_kernel(u8 *img, u64 span)
 {
 	int applied = 0;
 
 	/* Apple VM platform key hypercalls (see above). */
 	applied += patch_apple_key_hypercalls(img, span);
+
+	/* IOPCIDevice::extendedFindPCICapability() fast path (see above). */
+	applied += patch_apple_pci_capability_search(img, span);
 
 	return applied;
 }

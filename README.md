@@ -12,17 +12,19 @@ root volume mounts.
 The blocker is now post-mount: the kernel goes idle in `wfi` after the root
 volume is mounted, waiting on something that never arrives.
 
-Reaching the root volume needed one kernel-collection workaround (see
-`tools/kc_patch.py`). macOS 27's `IOPCIDevice::extendedFindPCICapability()`
-answers vendor-capability lookups out of a per-device capability dictionary
-built by `IOPCIBridge::constructCapabilitiesDict()`. A virtio-pci device
-exposes five capabilities that all share capability ID `0x09`, so that
-dictionary collapses to a single entry and the fast path hands back the same
-capability for every offset. `AppleVirtIOPCITransport::start()` walks vendor
-capabilities with `extendedFindPCICapability(9, &offset)` until it reports none
-left — which never happens — so it spun forever and no root media appeared.
-`tools/kc_patch.py` forces the reference config-space search; `qemu/run.sh`
-applies it to the staged kernel copy, leaving `kernel/` pristine.
+Reaching the root volume needed one kernel-collection workaround, applied by
+Gatehouse in `gatehouse/src/patch.c`. macOS 27's
+`IOPCIDevice::extendedFindPCICapability()` answers vendor-capability lookups
+out of a per-device capability dictionary built by
+`IOPCIBridge::constructCapabilitiesDict()`. A virtio-pci device exposes five
+capabilities that all share capability ID `0x09`, so that dictionary collapses
+to a single entry and the fast path hands back the same capability for every
+offset. `AppleVirtIOPCITransport::start()` walks vendor capabilities with
+`extendedFindPCICapability(9, &offset)` until it reports none left — which
+never happens — so it spun forever and no root media appeared. The workaround
+forces the reference config-space search; it is not virtio- or
+machine-specific (any device with several capabilities of the same ID trips
+it), so every target gets it.
 
 ### Milestones
 - [x] UART/serial reached
