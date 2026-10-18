@@ -47,8 +47,9 @@ static u64 trestle_counter(void)
 #endif
 }
 
-// The counter's frequency.  It is *not* the frequency the tree declares: XNU
-// derives its conversions from CNTFRQ_EL0, so the clock model has to as well.
+// The counter's frequency.  It is the frequency the tree declares as well --
+// XNU's pe_identify_machine() reads that property into its time base -- so
+// the clock model and the machine description have to agree.
 static u32 trestle_counter_hz(void)
 {
 #if defined(__aarch64__)

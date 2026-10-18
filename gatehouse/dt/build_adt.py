@@ -187,7 +187,28 @@ PCIE_INTX_BASE = 35
 # child, but the machine does not instantiate the controller, so no node for it
 # is published here: see the note above /arm-io in build().
 
-TIMEBASE_HZ = 24000000             # architected timer frequency (QEMU virt)
+# The architected counter's frequency -- the value the machine's firmware
+# reports in CNTFRQ_EL0 and the frequency its CNTVCT actually counts at.  This
+# is a *machine-specific* value and it must match the counter QEMU really runs.
+#
+# pe_identify_machine() (pexpert/arm/pe_identify_machine.c) reads /cpus/cpu0's
+# timebase-frequency -- and the sibling bus-/memory-/peripheral-/fixed-/
+# clock-frequency properties -- straight into gPEClockFrequencyInfo.  That is
+# the kernel's time base: mach_absolute_time(), the clock conversions and the
+# deadlines the kernel arms its timer with all come from it (it is *not* just
+# the clock description published to userland), so a wrong value here does not
+# merely mislabel anything: the kernel's tick period becomes wrong by the same
+# ratio.
+#
+# QEMU's `max` CPU clears ARM_FEATURE_BACKCOMPAT_CNTFRQ
+# (target/arm/tcg/cpu64.c), so with -cpu max -- and with the unversioned `virt`
+# machine type on QEMU >= 9.0 -- the counter runs at the architectural 1 GHz,
+# *not* the 62.5 MHz that older QEMU used.  Declaring the authentic AVP value
+# (24 MHz) here made every kernel interval 41.7x too long and armed the timer
+# 41.7x too often, which starved the CPU and made device timeouts fire before
+# the device could answer.  Keep this in step with trestle_machine_qemu_virt()
+# and with CPU=/MEM= in qemu/run.sh.
+TIMEBASE_HZ = 1000000000
 
 # ---------------------------------------------------------------------------
 # Phandles.  XNU resolves a node by its AAPL,phandle property only, so the
@@ -698,11 +719,11 @@ def build():
     # the PMU overflow interrupt (the machine's own DTB wires PPI 7 to
     # arm,armv8-pmuv3, so the ids are machine-neutral).
     #
-    # The *-frequency values are the architected timer's frequency, which is
-    # what the platform declares for the timebase on the AVP as well (24 MHz,
-    # not the 1 GHz CNTFRQ_EL0 QEMU's max cpu reports -- XNU derives its
-    # conversions from CNTFRQ_EL0 on arm64 and uses these for the clock
-    # description it publishes to userland).
+    # The *-frequency values are the architected timer's frequency: the same
+    # number the machine reports in CNTFRQ_EL0.  This is where XNU gets its
+    # time base from (see TIMEBASE_HZ above), so it has to match the counter
+    # this machine actually runs.  The authentic AVP declares 24 MHz for all
+    # six; only the *value* is machine-specific, and QEMU's counter is 1 GHz.
     # ---------------------------------------------------------------------
     cpu0 = node(
         "cpu0",

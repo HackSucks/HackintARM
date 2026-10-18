@@ -154,7 +154,14 @@ trestle_machine *trestle_machine_qemu_virt(void)
     m.windows = g_qemu_windows;
     m.window_count = TRESTLE_ARRAY_SIZE(g_qemu_windows);
 
-    m.timebase_hz = 24000000;           // QEMU virt's architected timer
+    // The architected counter's frequency.  QEMU's `max` CPU clears
+    // ARM_FEATURE_BACKCOMPAT_CNTFRQ, so this machine's CNTVCT runs at the
+    // architectural 1 GHz, not the 62.5 MHz older QEMU used.  XNU reads this
+    // value out of a machine description built from it (see TIMEBASE_HZ in
+    // gatehouse/dt/build_adt.py for the whole path), so it must match the
+    // counter the machine really runs or every kernel interval is scaled by
+    // the error.  The AVP machine keeps the authentic 24 MHz.
+    m.timebase_hz = 1000000000;
 
     // Gatehouse reserves this inside the boot-data window below
     // topOfKernelData (gh_panic_phys in gatehouse/main.c is the same value).
