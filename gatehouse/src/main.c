@@ -11,6 +11,7 @@
  * beyond the device tree we *hand* to the kernel.
  */
 #include "gh.h"
+#include "version.h"
 
 static EFI_SYSTEM_TABLE *ST;
 static EFI_BOOT_SERVICES *BS;
@@ -81,13 +82,17 @@ static void ucs2_to_ascii(char *dst, const CHAR16 *src, u64 cap)
 
 static void banner(void)
 {
+	char ver[8];
+
 	puts_("\n");
-	puts_("  Gatehouse - HackintARM bootloader\n");
-	puts_("  ---------------------------------\n");
-	puts_("  UEFI stage. Target: XNU arm64e (macOS 27).\n\n");
-	puts_("firmware vendor : ");
+	puts_("Gatehouse ");
+	puts_(gh_version_string(ver));
+	puts_(", built with " GH_COMPILER " at " GH_BUILD_DATE " " GH_BUILD_TIME
+	    ", running on ");
 	print_ucs2(ST->FirmwareVendor);
 	nl();
+	puts_("---------------------------------\n");
+	puts_("UEFI stage. Target: XNU arm64e (macOS 27).\n\n");
 	gh_loghex("system table    : ", (u64)ST);
 	gh_loghex("boot services   : ", (u64)BS);
 	gh_loghex("firmware rev    : ", (u64)ST->FirmwareRevision);

@@ -5,6 +5,43 @@
  * gatehouse/src/lib.c - freestanding string/memory helpers + logging.
  */
 #include "gh.h"
+#include "version.h"
+
+/*
+ * Build the build number from __DATE__, which C guarantees is "Mmm DD YYYY"
+ * (the day is space-padded, not zero-padded, for single digits).  We want
+ * DDMMYY followed by the stage suffix.
+ */
+const char *gh_version_string(char *buf)
+{
+	static const char months[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+	const char *d = __DATE__;
+	const char *p = months;
+	int mon = 1, day, year, i = 0;
+
+	for (; p < months + 36; p += 3) {
+		if (p[0] == d[0] && p[1] == d[1] && p[2] == d[2]) {
+			mon = (int)((p - months) / 3) + 1;
+			break;
+		}
+	}
+	day = (d[4] == ' ' ? 0 : d[4] - '0') * 10 + (d[5] - '0');
+	year = (d[7] - '0') * 1000 + (d[8] - '0') * 100 +
+	    (d[9] - '0') * 10 + (d[10] - '0');
+
+	buf[i++] = (char)('0' + day / 10);
+	buf[i++] = (char)('0' + day % 10);
+	buf[i++] = (char)('0' + mon / 10);
+	buf[i++] = (char)('0' + mon % 10);
+	buf[i++] = (char)('0' + (year / 10) % 10);
+	buf[i++] = (char)('0' + year % 10);
+
+	for (p = GH_VERSION_STAGE; *p; p++) {
+		buf[i++] = *p;
+	}
+	buf[i] = 0;
+	return buf;
+}
 
 void *gh_memset(void *d, int c, u64 n)
 {
