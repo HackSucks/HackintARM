@@ -7,13 +7,21 @@
 #
 # Builds the ESP tree (build/esp) from gatehouse/ and kernel/, then launches
 # QEMU with the TCG (software) CPU so this works on an x86_64 host.  A GDB
-# stub is enabled on :1234 so LLDB/GDB can attach without stopping the boot.
+# stub is available on :1234 (GDB=1) so LLDB/GDB can attach without stopping
+# the boot; it is opt-in because runs with it have been seen to stall under
+# TCG.
 #
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 GH="$ROOT/gatehouse"
-KERNEL="${KERNEL:-$ROOT/kernel/kernel.development.vmapple}"
+# The kernel image.  This must be the *kernel collection* (MH_FILESET): XNU's
+# kext loading, IOKit matching and the whole boot path below depend on the
+# collection layout.  A bare kernel (e.g. kernel.development.vmapple, the
+# kernel slice on its own) parses but panics early in
+# IOPlatformExpertDevice::generatePlatformUUID, so it is never the right image
+# to bring up with.  Override with KERNEL=/path/to/other.kc when needed.
+KERNEL="${KERNEL:-$ROOT/kernel/kernelcache.release.vma2.kc}"
 ESP="$ROOT/build/esp"
 MEM="${MEM:-3G}"
 CPU="${CPU:-max}"
@@ -43,6 +51,12 @@ FW_VARS=/usr/share/edk2/aarch64/QEMU_VARS.fd
 
 echo "== building gatehouse =="
 make -C "$GH" ${STALL:+STALL=$STALL} >/dev/null
+
+if [[ ! -f "$KERNEL" ]]; then
+  echo "error: kernel image not found: $KERNEL" >&2
+  echo "       (extract one from an IPSW; see README.local.md)" >&2
+  exit 1
+fi
 
 echo "== building device tree =="
 python3 "$GH/dt/build_adt.py" -o "$ROOT/build/gatehouse.adt"

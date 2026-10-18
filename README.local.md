@@ -37,8 +37,11 @@ then launches QEMU `virt` with AAVMF and a GICv3, with a GDB stub on `:1234`.
 
 ```sh
 # put an extracted VMApple kernel collection at kernel/kernelcache.release.vma2.kc
-KERNEL=kernel/kernelcache.release.vma2.kc GDB=0 ./qemu/run.sh
+./qemu/run.sh
 ```
+
+The launcher defaults to that kernel collection. `KERNEL=/path/to/other.kc`
+overrides it; the image has to be a collection, not a bare kernel slice.
 
 `kernel/` is not distributed with this repo; extract the images from a
 legitimate Apple IPSW (`tools/ipsw_extract.py`, `tools/im4p_extract.py`). The
