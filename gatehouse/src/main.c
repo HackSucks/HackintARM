@@ -438,7 +438,7 @@ static int load_and_jump(void)
 
 	/* Deliberate deviations from the shipped image (see patch.c). */
 	{
-		int np = gh_patch_kernel((u8 *)img, span);
+		int np = gh_patch_kernel((u8 *)img, span, &m);
 		gh_loghex("kernel patches  : ", (u64)np);
 	}
 

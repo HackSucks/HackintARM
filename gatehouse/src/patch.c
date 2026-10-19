@@ -18,6 +18,13 @@
 
 #define ARM64_NOP 0xd503201fu
 
+/* arm64e function furniture and a couple of one-instruction bodies. */
+#define ARM64_BTI_C	0xd503245fu	/* "bti c": only a direct branch may land */
+#define ARM64_PACIBSP	0xd503237fu	/* sign LR with the B key and SP */
+#define ARM64_RETAB	0xd65f0fffu	/* authenticate LR (B key, SP) and return */
+#define ARM64_MOV_W0_0	0x52800000u	/* "mov w0, #0" */
+#define PAGE_MASK	(~(u64)0xfff)	/* 4 KiB page base (~int would truncate) */
+
 static u32 rd32(const u8 *p)
 {
 	return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
@@ -54,81 +61,116 @@ static u64 find_pattern(const u8 *base, u64 size, const u32 *pat, u32 n)
 }
 
 /*
- * The Apple VM platform hands its guest two pieces of key material over
- * hypercalls at EL2, and the vmapple kernel treats "no answer" as fatal:
+ * Apple VM platform hypercalls on a machine that does not answer them.
  *
- *	0xc1000000	PAC_INIT_KEY_STATE	 (emitted once at the top of common_start)
- *	0xc1000001	default ROP/JOP pids	 (inlined at every site that reads them)
+ * The vmapple kernel calls up to EL2 with hvc #0 to ask its host for things
+ * only a virtualisation host can give it.  The ids live in Apple's own
+ * 0xc100____ space:
  *
- * EL2 on this machine is PSCI, which answers every function it does not know
- * with NOT_SUPPORTED (-1), so both calls fail and the kernel wedges.  Neither
- * value is a secret the kernel has to agree on with anyone else: the kernel
- * primes them, caches them in its own globals, and then only ever signs and
- * authenticates its own pointers with them, so leaving them at their reset
- * values is self-consistent.  We therefore neutralise exactly the wedge (the
- * 'cbnz x0, .' that spins forever) and leave the hvc in place -- it costs
- * nothing to trap and keeps the call sites recognisable.
+ *	0xc1000000	PAC_INIT_KEY_STATE	(once, at the top of common_start:
+ *						the host picks the kernel's
+ *						pointer-signing keys)
+ *	0xc1000001	default ROP/JOP pids	(inlined at every site that reads
+ *						them)
+ *	0xc1000003/4	publish a vcpu's state to the host
+ *	0xc1000005	guest feature query
+ *
+ * and every one of them treats "no answer" as fatal by branching to itself:
+ *
+ *	hvc	#0
+ *	cbnz	x0, .			; spin forever unless the host accepted
+ *
+ * EL2 on this machine is PSCI, which answers every function id it does not
+ * know with NOT_SUPPORTED (-1), so all 19 sites wedge -- common_start never
+ * even reaches the point where the kernel starts.  None of the values carried
+ * here has to be agreed with anyone: the kernel primes its own keys, caches
+ * them in its own globals and then only ever signs and authenticates its own
+ * pointers with them, so their reset values are self-consistent; the
+ * context/feature calls are "tell the host" calls whose only consequence for
+ * the guest is a cached copy of what it said.
+ *
+ * We therefore neutralise exactly the wedge -- the branch to self after the
+ * trap -- and leave the hvc in place: the trap costs nothing, the call sites
+ * stay recognisable, and a machine that does have an AVP host still reaches
+ * it.
+ *
+ * The rule is deliberately narrow: an hvc whose x0 is built from a 0xc100
+ * halfword within the four instructions before it, followed by a branch to
+ * itself.  PSCI's CPU_OFF and CPU_DEFAULT_SUSPEND (0x84000002/0xc400000e)
+ * also end in a parking loop, but there the CPU is meant never to come back,
+ * which is correct behaviour and must not be touched.
  */
-static int patch_apple_key_hypercalls(u8 *img, u64 span)
+#define ARM64_HVC0 0xd4000002u
+
+/* "movz|movk wN|xN, #imm16, lsl #shift"? */
+static int mov_imm(u32 insn, u32 *imm16, u32 *shift)
 {
-	static const u32 sig_pac[] = { 0xd2b82000u, 0xd4000002u, 0xb5000000u };
-	u64 off = find_pattern(img, span, sig_pac, 3);
-	int applied = 0;
-
-	if (off != (u64)-1) {
-		wr32(img + off + 8, ARM64_NOP);
-		applied++;
+	if ((insn & 0xff800000u) != 0x52800000u &&	/* movz w */
+	    (insn & 0xff800000u) != 0x72800000u &&	/* movk w */
+	    (insn & 0xff800000u) != 0xd2800000u &&	/* movz x */
+	    (insn & 0xff800000u) != 0xf2800000u) {	/* movk x */
+		return 0;
 	}
+	*imm16 = (insn >> 5) & 0xffffu;
+	*shift = ((insn >> 21) & 3u) * 16u;
+	return 1;
+}
 
-	/*
-	 * The 0xc1000001 sites all have the same five-instruction shape; the
-	 * temporary register N is the only thing that varies (and the same N
-	 * appears in all three of its instructions, which is what pins the
-	 * function id to 0xc1000001 rather than one of the nearby ids).
-	 *
-	 *	movz	wN, #1
-	 *	movk	wN, #0xc100, lsl #16
-	 *	mov	x0, wN
-	 *	hvc	#0
-	 *	cbnz	x0, .			; wedge unless the hypervisor answered
-	 */
-	{
-		u64 i;
-		u32 sites = 0;
+/* Does one of the four instructions before this hvc build an 0xc100 id? */
+static int avp_call_id(const u8 *img, u64 at)
+{
+	u32 k;
 
-		for (i = 0; i + 20 <= span; i += 4) {
-			u32 r0 = rd32(img + i);
-			u32 r1 = rd32(img + i + 4);
-			u32 r2 = rd32(img + i + 8);
-			u32 n;
+	for (k = 1; k <= 4; k++) {
+		u32 imm16, shift;
 
-			if ((r0 & 0xffffffe0u) != 0x52800020u) {	/* movz wN, #1 */
-				continue;
-			}
-			if ((r1 & 0xffffffe0u) != 0x72b82000u) {	/* movk wN, #0xc100, lsl #16 */
-				continue;
-			}
-			n = r0 & 0x1fu;
-			if ((r1 & 0x1fu) != n) {
-				continue;
-			}
-			if (r2 != (0xaa0003e0u | (n << 16))) {		/* mov x0, wN */
-				continue;
-			}
-			if (rd32(img + i + 12) != 0xd4000002u) {	/* hvc #0 */
-				continue;
-			}
-			if (rd32(img + i + 16) != 0xb5000000u) {	/* cbnz x0, . */
-				continue;
-			}
-			wr32(img + i + 16, ARM64_NOP);
-			sites++;
+		if (mov_imm(rd32(img + at - 4 * k), &imm16, &shift) &&
+		    imm16 == 0xc100u) {
+			return 1;
 		}
-		gh_loghex("vm platform key hypercalls neutralised: ", sites);
-		applied += (int)sites;
+	}
+	return 0;
+}
+
+/*
+ * A branch to itself: "b ." (B with a zero displacement) or "cbz/cbnz
+ * wN|xN, ." (conditional, zero 19-bit displacement).  Nothing can leave such
+ * a loop, which is what makes these sites wedges rather than retries.
+ */
+static int is_self_branch(u32 insn)
+{
+	if ((insn & 0xfc000000u) == 0x14000000u) {	/* B */
+		return (insn & 0x03ffffffu) == 0u;
+	}
+	if ((insn & 0x7f000000u) == 0x34000000u ||	/* CBZ  w/x */
+	    (insn & 0x7f000000u) == 0x35000000u) {	/* CBNZ w/x */
+		return ((insn >> 5) & 0x7ffffu) == 0u;
+	}
+	return 0;
+}
+
+static int patch_apple_hypercalls(u8 *img, u64 span)
+{
+	u64 i;
+	u32 sites = 0;
+
+	for (i = 16; i + 8 <= span; i += 4) {
+		if (rd32(img + i) != ARM64_HVC0) {
+			continue;
+		}
+		if (!avp_call_id(img, i)) {
+			continue;
+		}
+		if (!is_self_branch(rd32(img + i + 4))) {
+			continue;
+		}
+		wr32(img + i + 4, ARM64_NOP);
+		sites++;
 	}
 
-	return applied;
+	gh_loghex("vm platform hypercall wedges neutralised: ", sites);
+
+	return (int)sites;
 }
 
 /*
@@ -189,15 +231,264 @@ static int patch_apple_pci_capability_search(u8 *img, u64 span)
 	return 1;
 }
 
-int gh_patch_kernel(u8 *img, u64 span)
+/*
+ * Root-volume authentication when the root was not attested by the host.
+ *
+ * macOS 27 on Apple Virtual platforms treats the root filesystem as an
+ * *authenticated* volume.  iBoot forwards the sealed root hash to the kernel
+ * in the device tree (system-volume-auth-blob, root-snapshot-name) and
+ * bsd_init() insists on it:
+ *
+ *	IOSecureBSDRoot(rootdevice);				bsd_init.c:916
+ *	...
+ *	require_rootauth = !imageboot_desired();
+ *	if (require_rootauth) {
+ *		autherr = VNOP_IOCTL(rootvnode, FSIOC_KERNEL_ROOTAUTH,
+ *		    NULL, 0, vfs_context_kernel());
+ *		if (autherr) panic("rootvp not authenticated after mounting");
+ *	}
+ *
+ * Both halves of that contract are missing here for the same reason -- the
+ * root did not come from Apple's boot chain -- so both deviations live here
+ * and every target gets them.
+ *
+ *   - IOSecureBSDRoot() asks the platform expert to vouch for the root with
+ *     callPlatformFunction("SecureRootName", ...).  That is a *host* service:
+ *     on Apple's own hypervisor the host attests the root volume it handed
+ *     the guest.  Nothing on the guest side can answer it, the dispatch never
+ *     returns, and the boot stops in bsd_init() without printing anything.
+ *
+ *   - APFS answers FSIOC_KERNEL_ROOTAUTH out of is_root_hash_
+ *     authentication_required(), which is true for any release-build System
+ *     volume ("Root Volume, root hash authentication is required").  With no
+ *     iBoot-forwarded root hash and no ARV snapshot on the medium, nothing
+ *     could ever satisfy it: the volume mounts and the kernel panics.
+ *
+ * So: the single "bl <IOSecureBSDRoot>" in bsd_init() becomes a nop, and
+ * is_root_hash_authentication_required() is made to return false -- the same
+ * statement the kernel logs ("root hash authentication is required"), negated,
+ * because without host attestation there is no root hash to check.  The
+ * consequence to be honest about: a kernel patched this way cannot detect a
+ * tampered root volume.
+ *
+ * Neither edit hardcodes an address.  Both functions are found by a C string
+ * they build ("SecureRootName", "is_root_hash_authentication_required"), then
+ * the adrp+add pair that materialises it, then the enclosing function entry,
+ * and the locators verify the shape of everything they touch.
+ */
+
+/*
+ * A kernel collection is loaded as a flat 1:1 image of its VA window, so a
+ * file offset and the address the code will run at differ by one constant
+ * (segment vmaddr - fileoff).  Gatehouse never relies on that, but the
+ * locators below must decode pc-relative operands, which needs a real
+ * address.  Return the constant only if every segment agrees on it, so an
+ * image with a different layout is left alone rather than mis-patched.
+ */
+static u64 kc_link_delta(const gh_macho *m)
+{
+	u64 delta = (u64)-1;
+	u32 i;
+
+	for (i = 0; i < m->nsegs; i++) {
+		const gh_segment *s = &m->segs[i];
+		u64 d;
+
+		if (s->filesize == 0) {
+			continue;			/* __bss-like */
+		}
+		d = s->vmaddr - s->fileoff;
+		if (delta == (u64)-1) {
+			delta = d;
+		} else if (delta != d) {
+			return (u64)-1;
+		}
+	}
+	return delta;
+}
+
+/* Offset of a NUL-terminated string in the image, or (u64)-1. */
+static u64 find_cstring(const u8 *img, u64 span, const char *s)
+{
+	u64 n = gh_strlen(s);
+	u64 i;
+
+	for (i = 0; i + n < span; i++) {
+		if (img[i] != (u8)s[0]) {
+			continue;
+		}
+		if (gh_memcmp(img + i, s, n) == 0 && img[i + n] == 0) {
+			return i;
+		}
+	}
+	return (u64)-1;
+}
+
+/*
+ * Find the "adrp xN, <page>; add xN, xN, #<off>" pair that materialises a
+ * given address.  Apple's compiler emits the two back to back, which is what
+ * makes a string reference a usable function locator.
+ */
+static u64 find_adrp_add(const u8 *img, u64 span, u64 delta, u64 target)
+{
+	u64 i;
+
+	for (i = 0; i + 8 <= span; i += 4) {
+		u32 insn = rd32(img + i);
+		i64 imm;
+		u64 page;
+		u32 add, imm12;
+
+		if ((insn & 0x9f000000u) != 0x90000000u) {	/* ADRP */
+			continue;
+		}
+		imm = (i64)((((u64)(insn >> 5) & 0x7ffffu) << 2) |
+		    ((insn >> 29) & 3u));
+		if (imm & (1 << 20)) {
+			imm -= (1 << 21);			/* sign-extend */
+		}
+		page = ((delta + i) & PAGE_MASK) + (u64)(imm << 12);
+		if (page != (target & PAGE_MASK)) {
+			continue;
+		}
+		add = rd32(img + i + 4);
+		if ((add & 0x7f000000u) != 0x11000000u ||	/* ADD (immediate) */
+		    (add & 0x80000000u) == 0u ||		/* 64-bit form */
+		    ((add >> 22) & 3u) != 0u ||			/* no shift */
+		    (add & 0x1fu) != ((add >> 5) & 0x1fu)) {	/* same register */
+			continue;
+		}
+		imm12 = (add >> 10) & 0xfffu;
+		if (page + imm12 == target) {
+			return i;
+		}
+	}
+	return (u64)-1;
+}
+
+/*
+ * Walk back from a reference to the enclosing function's entry: the nearest
+ * "pacibsp" (every function in the collection is arm64e and opens with the
+ * B-key pair), including a preceding "bti c" when it has one.
+ */
+static u64 find_function_entry(const u8 *img, u64 ref)
+{
+	u64 e;
+
+	if (ref < 4) {
+		return (u64)-1;
+	}
+	for (e = ref; e >= 4; e -= 4) {
+		if (rd32(img + e) == ARM64_PACIBSP) {
+			break;
+		}
+	}
+	if (e < 4) {
+		return (u64)-1;
+	}
+	if (rd32(img + e - 4) == ARM64_BTI_C) {
+		e -= 4;
+	}
+	return e;
+}
+
+/* Count "bl" sites that land on a function; record up to `max` of them. */
+static u32 find_bl_callers(const u8 *img, u64 span, u64 delta, u64 func,
+    u64 *out, u32 max)
+{
+	u64 i;
+	u32 n = 0;
+
+	for (i = 0; i + 4 <= span; i += 4) {
+		u32 insn = rd32(img + i);
+		i64 imm;
+
+		if ((insn & 0xfc000000u) != 0x94000000u) {	/* BL */
+			continue;
+		}
+		imm = (i64)(insn & 0x03ffffffu);
+		if (imm & (1 << 25)) {
+			imm -= (1 << 26);			/* sign-extend */
+		}
+		if ((u64)((i64)(delta + i) + (imm << 2)) == func) {
+			if (out && n < max) {
+				out[n] = i;
+			}
+			n++;
+		}
+	}
+	return n;
+}
+
+/*
+ * Replace a predicate's body with "return false", leaving its BTI landing pad
+ * in place.  The stub re-signs the link register with the same B-key/SP pair
+ * the real prologue would have used, so it can return through the caller's
+ * frame without ever touching SP.
+ */
+static void write_pretend_false(u8 *img, u64 entry)
+{
+	u64 at = entry;
+
+	if (rd32(img + at) == ARM64_BTI_C) {
+		at += 4;
+	}
+	wr32(img + at, ARM64_MOV_W0_0);
+	wr32(img + at + 4, ARM64_PACIBSP);
+	wr32(img + at + 8, ARM64_RETAB);
+}
+
+static int patch_apple_root_auth(u8 *img, u64 span, const gh_macho *m)
+{
+	u64 delta = kc_link_delta(m);
+	u64 str, ref, fn, calls[4];
+	int applied = 0;
+
+	if (delta == (u64)-1) {
+		return 0;
+	}
+
+	/* 1. bsd_init()'s call to IOSecureBSDRoot(). */
+	str = find_cstring(img, span, "SecureRootName");
+	if (str != (u64)-1) {
+		ref = find_adrp_add(img, span, delta, delta + str);
+		fn = (ref == (u64)-1) ? (u64)-1 : find_function_entry(img, ref);
+		if (fn != (u64)-1 &&
+		    find_bl_callers(img, span, delta, delta + fn, calls, 4) == 1) {
+			wr32(img + calls[0], ARM64_NOP);
+			gh_loghex("host root attestation bypassed: ", 1);
+			applied++;
+		}
+	}
+
+	/* 2. APFS's root-hash requirement, answered "no". */
+	str = find_cstring(img, span, "is_root_hash_authentication_required");
+	if (str != (u64)-1) {
+		ref = find_adrp_add(img, span, delta, delta + str);
+		fn = (ref == (u64)-1) ? (u64)-1 : find_function_entry(img, ref);
+		if (fn != (u64)-1 && rd32(img + fn) == ARM64_BTI_C &&
+		    rd32(img + fn + 4) == ARM64_PACIBSP) {
+			write_pretend_false(img, fn);
+			gh_loghex("root hash authentication relaxed: ", 1);
+			applied++;
+		}
+	}
+
+	return applied;
+}
+
+int gh_patch_kernel(u8 *img, u64 span, const gh_macho *m)
 {
 	int applied = 0;
 
-	/* Apple VM platform key hypercalls (see above). */
-	applied += patch_apple_key_hypercalls(img, span);
+	/* Apple VM platform hypercalls (see above). */
+	applied += patch_apple_hypercalls(img, span);
 
 	/* IOPCIDevice::extendedFindPCICapability() fast path (see above). */
 	applied += patch_apple_pci_capability_search(img, span);
+
+	/* Root-volume authentication with no host attestation (see above). */
+	applied += patch_apple_root_auth(img, span, m);
 
 	return applied;
 }

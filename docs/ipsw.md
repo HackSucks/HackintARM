@@ -36,6 +36,7 @@ straight to disk and resumes a partial stored member on a re-run.
 | `kernelcache.release.vma2` | ~22 MiB | the kernel collection (XNU + prelinked kexts) gatehouse loads |
 | `BuildManifest.plist` | 31 MiB | identity/member table |
 | `043-70867-635.dmg.aea` | 11.27 GiB | **the root volume** (`OS`), AEA profile 1 (decryptable — see below) |
+| `Firmware/043-70867-635.dmg.aea.trustcache` | 441,049 B | **the root volume's static trust cache** (IMG4 `trst`, see below) |
 | `094-86031-269.dmg` | 7.71 GiB | `Cryptex1,RosettaOS` — plain raw APFS image |
 | `043-70637-685.dmg` | 54 MiB | `Cryptex1,AppOS` — plain raw APFS image |
 | `043-70833-682.dmg` | 373 MiB | `RestoreRamDisk` — IM4P-wrapped payload |
@@ -102,6 +103,49 @@ PYTHON=.venv/bin/python tools/grab_vmapple_rootfs.sh /mnt/windows2/vmapple-rootf
 `Cryptex1,SystemOS` (2.42 GiB) and `BaseSystem` (1.31 GiB) are AEA of the same
 shape and decrypt the same way; the two plain APFS cryptexes are the pieces of
 the root filesystem Apple mounts into place at boot.
+
+## The static trust cache
+
+Every disk image in the restore image has a matching `Firmware/<name>.trustcache`
+member (441,049 bytes for the root volume, 23,411 for the restore ramdisk, ...).
+It is the set of cdhashes the boot chain is willing to treat as **platform
+binaries**, and macOS 27 refuses to execute `launchd` without it:
+
+```
+AMFI: /sbin/launchd: Rejecting signature, binary has platform identifier but
+      is not in the trustcache
+AMFI: hook..execve() killing init (pid 1): Attempt to execute completely
+      unsigned code (must be at least ad-hoc signed).
+```
+
+(`amfi_get_out_of_my_way=1` does not relax this on 26A428; the platform-identifier
+policy is not boot-arg controlled.)
+
+The member is not a raw structure but an **IMG4** wrapper, which is what iBoot
+verifies and then hands over as a payload:
+
+```
+30 83 06ba d4           SEQ
+  16 04 "IM4P"          16 04 "trst"          16 01 "1"
+  04 83 06ba c0         OCTET STRING (441,024 bytes)
+    02 00 00 00         version 2
+    26 49 6f 5f ...     uuid[16]
+    c7 47 00 00         count = 18,375
+    ...                 18,375 entries of 24 bytes (24 + 18375*24 = 441,024)
+```
+
+XNU finds it through the device tree, exactly where iBoot puts it:
+
+* `/chosen/memory-map/TrustCache` -- a **16-byte** property, `(base, length)`,
+  the physical region holding the payload. `kern_trustcache.c` checks the
+  property size (`Unexpected /chosen/memory-map/TrustCache property size %u !=
+  %zu`), range-checks the region and copies the entries out. The authentic
+  static tree has only zeroed `MemoryMapReserved-N` placeholders; the named
+  entries are iBoot runtime additions, so a loader that plays iBoot has to add
+  this one itself.
+* `/osenvironments/<env>/amfi-allows-trust-cache-load` selects whether
+  *additional* (loadable) trust caches may be loaded later; it does not
+  substitute for the static one.
 
 ## Extracting
 

@@ -84,8 +84,13 @@ int gh_macho_load_flat(const gh_macho *m, u64 phys_dest, u64 *out_top);
  */
 int gh_apply_fixups(const gh_macho *m, u8 *img);
 
-/* patch.c - load-time fixups, applied to the flattened image in memory. */
-int gh_patch_kernel(u8 *img, u64 span);
+/*
+ * patch.c - load-time fixups, applied to the flattened image in memory.
+ * `m` is the parsed image: the patches decode pc-relative operands to find
+ * the code they edit, which needs the segment table to turn a file offset
+ * into the address the instruction will run at.
+ */
+int gh_patch_kernel(u8 *img, u64 span, const gh_macho *m);
 
 /* bootargs.c */
 int gh_bootargs_build(void *dst, u64 virt_base, u64 phys_base, u64 mem_size,
