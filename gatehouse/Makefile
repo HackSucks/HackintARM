@@ -21,7 +21,8 @@ ifdef STALL
 CFLAGS += -DGH_ATTACH_STALL_MS=$(STALL)
 endif
 
-SRCS := src/main.c src/lib.c src/uart.c src/macho.c src/bootargs.c src/fixups.c src/patch.c
+SRCS := src/main.c src/lib.c src/uart.c src/macho.c src/bootargs.c src/fixups.c \
+        src/patch.c src/adt.c
 OBJS := $(SRCS:.c=.o) src/jump.o
 HDRS := $(wildcard include/*.h)
 

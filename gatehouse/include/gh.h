@@ -92,9 +92,26 @@ int gh_apply_fixups(const gh_macho *m, u8 *img);
  */
 int gh_patch_kernel(u8 *img, u64 span, const gh_macho *m);
 
+/*
+ * Point XNU's PID 1 at another program (Linux's init=, for bring-up).  The
+ * path must be absolute and no longer than the shipped one; a machine with a
+ * complete root volume runs it as-is, one without gets a shell.
+ */
+int gh_patch_init_program(u8 *img, u64 span, const gh_macho *m,
+    const char *path);
+
 /* bootargs.c */
 int gh_bootargs_build(void *dst, u64 virt_base, u64 phys_base, u64 mem_size,
     u64 top_of_kernel_data, u64 dt_phys, u32 dt_len, const char *cmdline);
+
+/*
+ * adt.c - edit the device tree in memory.  iBoot fills /chosen/memory-map in
+ * as it loads each boot object, so a loader has to be able to append
+ * properties to a node; `size` is the tree's length in and out and `cap`
+ * bounds the buffer it lives in.
+ */
+int gh_adt_add_property(u8 *dt, u64 cap, const char *path, const char *name,
+    const void *value, u32 len, u64 *size);
 
 /* jump.S */
 void gh_jump_to_kernel(u64 entry, u64 bootargs_pa, u64 stack_top,

@@ -46,6 +46,24 @@ EXTRA=("$@")
 ROOTIMG="${ROOTIMG:-/mnt/windows2/vmapple-rootfs/043-70867-635.dmg}"
 ROOTIMG_RO="${ROOTIMG_RO:-1}"
 
+# The root volume's static trust cache (IMG4 "trst" member).  XNU needs it to
+# accept the platform binaries on that volume -- launchd first of all -- and
+# Gatehouse delivers it the way iBoot does: it loads the payload, puts it in
+# the boot-data window and publishes /chosen/memory-map/TrustCache.  Override
+# with TRUSTCACHE=/path/to/file.
+TRUSTCACHE="${TRUSTCACHE:-$ROOT/kernel/trustcache.release.vma2}"
+
+# The restore ramdisk (IMG4 "rdsk" member, e.g. 043-70833-682.dmg from the
+# IPSW).  When RAMDISK is set, Gatehouse hands it to XNU the way iBoot does for
+# a restore boot: the payload goes inside the boot window, /chosen/memory-map
+# gets a RAMDisk entry, and the command line names it as the root device
+# (rd=md0).  Its own trust cache has to travel with it -- the ramdisk binaries
+# are not in the platform cache -- and Gatehouse puts that one first, because
+# only the first module becomes the static trust cache.  Unset by default, so
+# an ordinary boot is unaffected.
+RAMDISK="${RAMDISK:-}"
+RAMDISKTC="${RAMDISKTC:-$ROOT/kernel/ramdisk.trustcache}"
+
 FW_CODE=/usr/share/edk2/aarch64/QEMU_EFI.fd
 FW_VARS=/usr/share/edk2/aarch64/QEMU_VARS.fd
 
@@ -67,6 +85,35 @@ mkdir -p "$ESP/EFI/BOOT" "$ESP/gatehouse"
 cp "$GH/BOOTAA64.EFI" "$ESP/EFI/BOOT/BOOTAA64.EFI"
 cp "$KERNEL" "$ESP/gatehouse/kernel"
 cp "$ROOT/build/gatehouse.adt" "$ESP/gatehouse/gatehouse.adt"
+if [[ -f "$TRUSTCACHE" ]]; then
+  cp "$TRUSTCACHE" "$ESP/gatehouse/trustcache"
+else
+  echo "== no trust cache at $TRUSTCACHE: platform binaries will be rejected =="
+fi
+# Bring-up handover (see gatehouse/src/patch.c): the program to run as PID 1,
+# installed only when INIT is set.  Nothing to revert afterwards -- an ordinary
+# boot has no such file and runs launchd.
+if [[ -n "${INIT:-}" ]]; then
+  printf '%s\n' "$INIT" > "$ESP/gatehouse/init"
+  echo "== PID 1 override: $INIT =="
+fi
+# Restore ramdisk handover: the IMG4 object as downloaded (Gatehouse unwraps the
+# "rdsk" payload) plus the trust cache generated for its contents.
+if [[ -n "$RAMDISK" ]]; then
+  if [[ -f "$RAMDISK" ]]; then
+    cp "$RAMDISK" "$ESP/gatehouse/ramdisk"
+    echo "== restore ramdisk: $RAMDISK =="
+    if [[ -f "$RAMDISKTC" ]]; then
+      cp "$RAMDISKTC" "$ESP/gatehouse/ramdisktc"
+      echo "== ramdisk trust cache: $RAMDISKTC =="
+    else
+      echo "== no ramdisk trust cache at $RAMDISKTC: its binaries will be rejected =="
+    fi
+  else
+    echo "error: ramdisk not found: $RAMDISK" >&2
+    exit 1
+  fi
+fi
 ls -l "$ESP/EFI/BOOT/BOOTAA64.EFI" "$ESP/gatehouse/"
 
 # XNU's pe_fiq.c is a GICv3 driver: pe_init_fiq() maps /arm-io/gic's GICD and
@@ -98,7 +145,6 @@ QARGS=(
   -cpu "$CPU"
   -m "$MEM"
   -bios "$FW_CODE"
-  -nographic
   -drive "if=none,id=hd0,format=raw,file=fat:rw:$ESP"
   # The AVP describes no I/O port window (its "ranges" carries only MMIO), and
   # QEMU's own vmapple machine force-disables legacy virtio for the same
@@ -123,6 +169,44 @@ fi
 
 if [[ "$USE_GDB" == "1" ]]; then
   QARGS+=(-gdb "tcp::$GDB_PORT")
+fi
+
+# Console.  By default the guest's serial port is QEMU's stdio, so a boot is
+# run with its output redirected to a file and nothing can be typed into it.
+# SERIAL=/path/to/socket puts the port on a unix socket instead and waits for a
+# client before starting the guest, so an interactive boot -- a single-user
+# shell, a recovery environment -- keeps every byte and can be driven with e.g.
+#
+#	socat -,raw,echo=0 UNIX-CONNECT:/tmp/opencode/ser.sock
+#
+# or build/console.py, which also tees the port to a log file.
+if [[ -n "${SERIAL:-}" ]]; then
+  # The pl011 carries XNU's own printf: pe_serial drives it from the
+  # /arm-io/uart0 node ("arm,pl011"), which is where the boot log comes from.
+  # Userland has no driver for "arm,pl011" at all, so it is a log and nothing
+  # more.
+  QARGS+=(-display none -serial "unix:$SERIAL,server=on,wait=on")
+  # The guest's own console is a *virtio console*, exactly as on a
+  # Virtualization.framework guest: com.apple.driver.AppleVirtIO's
+  # AppleVirtIOConsole personality carries IOVirtIOPrimaryMatch = 0x00031af4
+  # (virtio type 3, vendor 0x1af4) on IOProviderClass AppleVirtIOTransport, and
+  # a modern-only virtio-serial-pci enumerates as exactly that.  It is the only
+  # thing in the machine that turns into a tty, so it is the only place a
+  # shell's stdin can come from.  A separate chardev rather than a mux of the
+  # two: a mux routes input to one focused head only.  Nothing in the ADT has
+  # to change -- AppleVirtIOPCITransport finds the device over PCI.
+  if [[ -n "${CONSOLE:-}" ]]; then
+    # No wait=on here: -chardev is created while the command line is parsed,
+    # i.e. before -serial, so a blocking open would hold the whole machine
+    # (including the pl011 that carries the boot log) hostage until a client
+    # turned up.  Nothing writes to this port before userland, so there is
+    # nothing to lose by opening it asynchronously.
+    QARGS+=(-chardev "socket,id=vc0,path=$CONSOLE,server=on,wait=off"
+            -device virtio-serial-pci,disable-legacy=on
+            -device virtconsole,chardev=vc0)
+  fi
+else
+  QARGS+=(-nographic)
 fi
 
 echo "== launching QEMU (gdb=$USE_GDB port=$GDB_PORT) =="

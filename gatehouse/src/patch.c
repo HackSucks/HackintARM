@@ -477,6 +477,168 @@ static int patch_apple_root_auth(u8 *img, u64 span, const gh_macho *m)
 	return applied;
 }
 
+/*
+ * Diagnostic handover: run a different program as PID 1.
+ *
+ * XNU's load_init_program() execs one path -- "/sbin/launchd" in a release
+ * kernel -- and no boot-arg or device tree property changes it.  On a machine
+ * whose root volume is not (yet) a complete macOS install, that leaves the
+ * boot wherever launchd stops, with no way to look around, and the first thing
+ * a bring-up needs is a shell.  Linux has init= for exactly this; Gatehouse
+ * only edits the image when the caller asks it to (main.c's gh_init=<path>),
+ * and never touches the shipped default.
+ *
+ * The locator proves the byte string it rewrites is the one
+ * load_init_program() is about to exec, without hardcoding an address:
+ *
+ *	1. "load_init_program: attempting to load %s" is the format string of
+ *	   the printf() immediately before that exec, and the compiler
+ *	   materialises both it and the path argument with the usual
+ *	   "adrp xN, <page>; add xN, xN, #<off>" pair, back to back:
+ *
+ *		adrp	x20, <page>		; the path
+ *		add	x20, x20, #<off>
+ *		str	x20, [sp]		; argv[0]
+ *		adrp	x0, <page>		; the format string
+ *		add	x0, x0, #<off>
+ *		bl	printf
+ *		mov	x0, x20
+ *		bl	load_init_program_at_path
+ *
+ *	   so the path is the adrp+add pair eight bytes before the format
+ *	   string's, and the format string itself must be referenced exactly
+ *	   once (a second reference means the shape is not what we expect).
+ *	2. what that pair resolves to must look like the thing we are about to
+ *	   overwrite: a NUL-terminated absolute path in the image.
+ *	3. the replacement must fit in the space the shipped path occupies
+ *	   (14 bytes plus its NUL), so the strings that follow it -- the kernel
+ *	   uses the neighbours too -- are never disturbed.
+ *
+ * Any deviation from that shape and the image is left alone rather than
+ * half-patched.
+ */
+static const char init_fmt[] =
+    "load_init_program: attempting to load %s\n";
+
+/* Decode "adrp xN, <page>"; return the page address, or (u64)-1. */
+static u64 adrp_page(const u8 *img, u64 at, u64 delta, u32 *reg)
+{
+	u32 insn = rd32(img + at);
+	i64 imm;
+
+	if ((insn & 0x9f000000u) != 0x90000000u) {
+		return (u64)-1;
+	}
+	imm = (i64)((((u64)(insn >> 5) & 0x7ffffu) << 2) | ((insn >> 29) & 3u));
+	if (imm & (1 << 20)) {
+		imm -= (1 << 21);
+	}
+	*reg = insn & 0x1fu;
+	return ((delta + at) & PAGE_MASK) + (u64)(imm << 12);
+}
+
+/* Decode the "add xN, xN, #imm" that pairs with it; return the address. */
+static u64 adrp_add_target(const u8 *img, u64 at, u64 page, u32 reg)
+{
+	u32 insn = rd32(img + at);
+
+	if ((insn & 0x7f000000u) != 0x11000000u ||	/* ADD (immediate) */
+	    (insn & 0x80000000u) == 0u ||		/* 64-bit form */
+	    ((insn >> 22) & 3u) != 0u ||			/* no shift */
+	    (insn & 0x1fu) != reg ||			/* destination ... */
+	    ((insn >> 5) & 0x1fu) != reg) {		/* ... and source */
+		return (u64)-1;
+	}
+	return page + ((insn >> 10) & 0xfffu);
+}
+
+int gh_patch_init_program(u8 *img, u64 span, const gh_macho *m,
+    const char *path)
+{
+	u64 delta = kc_link_delta(m);
+	u64 fstr, first = (u64)-1, page, str = (u64)-1;
+	u64 i, k, n, orig, hits;
+	u32 refs = 0, reg;
+
+	if (delta == (u64)-1 || path == 0 || path[0] != '/') {
+		return 0;
+	}
+	n = gh_strlen(path);
+
+	/* The format string must exist and be referenced exactly once. */
+	fstr = find_cstring(img, span, init_fmt);
+	if (fstr == (u64)-1) {
+		return 0;
+	}
+	for (i = 0; i + 8 <= span; i += 4) {
+		u32 r;
+
+		page = adrp_page(img, i, delta, &r);
+		if (page == (u64)-1) {
+			continue;
+		}
+		if (adrp_add_target(img, i + 4, page, r) == delta + fstr) {
+			refs++;
+			if (first == (u64)-1) {
+				first = i;
+			}
+		}
+	}
+	if (refs != 1) {
+		return 0;
+	}
+
+	/*
+	 * The path is materialised by its own adrp+add just ahead of the
+	 * format string's -- with the argv[0] store between the two pairs --
+	 * so walk back over the instructions preceding the format reference
+	 * and keep the pair that really does resolve to a NUL-terminated
+	 * absolute path.  Exactly one of them may, or the shape is not the one
+	 * this patch was written against.
+	 */
+	for (hits = 0, k = 1; k <= 6 && first >= 4 * k; k++) {
+		u64 at = first - 4 * k, cand, off;
+
+		page = adrp_page(img, at, delta, &reg);
+		if (page == (u64)-1) {
+			continue;
+		}
+		cand = adrp_add_target(img, at + 4, page, reg);
+		if (cand == (u64)-1 || cand < delta) {
+			continue;
+		}
+		off = cand - delta;
+		if (off >= span || img[off] != '/') {
+			continue;
+		}
+		for (orig = 0; off + orig < span && img[off + orig] != 0 &&
+		    orig < 256; orig++) {
+		}
+		if (orig == 0 || orig == 256) {
+			continue;
+		}
+		hits++;
+		str = cand;
+	}
+	if (hits != 1) {
+		return 0;
+	}
+	i = str - delta;				/* image offset of the path */
+	for (orig = 0; i + orig < span && img[i + orig] != 0 &&
+	    orig < 256; orig++) {
+	}
+
+	/* The replacement has to fit in the space the shipped path occupies,
+	 * so the strings that follow it are never disturbed. */
+	if (n > orig) {
+		return 0;
+	}
+
+	gh_memcpy(img + i, path, n + 1);
+
+	return 1;
+}
+
 int gh_patch_kernel(u8 *img, u64 span, const gh_macho *m)
 {
 	int applied = 0;

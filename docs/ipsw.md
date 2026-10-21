@@ -170,3 +170,51 @@ PYTHON=.venv/bin/python tools/grab_vmapple_rootfs.sh /mnt/windows2/vmapple-rootf
     --member 043-70867-635.dmg.aea --fcs --info
 ```
 
+
+## The restore ramdisk (`rdsk`)
+
+A restore boot hands XNU two things instead of one: the kernel collection and a
+ramdisk.  QEMU's launcher stages the second one behind `RAMDISK=`:
+
+```sh
+RAMDISK=/mnt/windows2/restoreramdisk.dmg qemu/run.sh
+```
+
+`RAMDISK` is the member as shipped (an IMG4 object with the payload in
+`rdsk`); Gatehouse unwraps it, copies the payload into the boot window, and
+publishes it the way iBoot does:
+
+* `\gatehouse\ramdisk` -- the IMG4 object.  Only the `rdsk` payload is used.
+* `/chosen/memory-map/RAMDisk` -- `{ paddr, length }`.  `IOKitBSDInit` turns
+  that into `/dev/md0` before the root device is chosen.
+* the command line gains ` rd=md0 -s`.  `rd` names the root device
+  (`bsd_rooted_ramdisk()` in `bsd/kern/bsd_init.c`), and `-s` asks the
+  ramdisk's `launchd` for a single-user shell on `/dev/console`.
+
+The payload has to live inside the same window as the kernel, because
+`arm_vm_physmap_init()` maps `[end_kern, topOfKernelData)` once (device tree,
+ramdisk, boot args) and never returns it to the VM allocator.  It is placed
+above the panic log, so `topOfKernelData` grows by the ramdisk's size; anything
+outside that window is free memory the allocator will hand out from under the
+guest.
+
+### Its trust cache is a different IMG4 type
+
+A trust cache module is a `trust_cache_offsets_t` (`u32 num_caches`, then one
+`u32` offset per module, offsets relative to the container base).  Each module
+is `{ u32 version; uuid_t uuid; u32 num_entries; }` followed by the entries --
+22 bytes each at version 1, 24 at version 2.
+
+The wrapper around it is not always `trst`:
+
+| file | IMG4 type | version | entries |
+| --- | --- | --- | --- |
+| `kernel/trustcache.release.vma2` | `trst` | 2 | 18375 |
+| `kernel/ramdisk.trustcache` | `rtsc` | 1 | 1062 |
+
+Only the first module becomes the static trust cache; module 1 is a second
+static cache only under `CONFIG_SECOND_STATIC_TRUST_CACHE` with
+`allowSecondStaticTC`, and is otherwise skipped as an engineering cache.  So
+the module matching the intended root device goes first -- the ramdisk's cache
+when `rd=md0`, the platform's otherwise.  Stage the ramdisk's as
+`\gatehouse\ramdisktc`.

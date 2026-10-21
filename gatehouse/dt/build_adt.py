@@ -838,7 +838,8 @@ def build():
     chosen = node(
         "chosen",
         ("AAPL,phandle", u32(PHANDLE_CHOSEN)),
-        ("boot-args", s("debug=0x14e -v -noprogress serial=1 cpus=1 kextlog=0xfff keepsyms=1 exe_boothash_salt=0")),
+        # Gatehouse overrides this with GH_CMD_LINE; keep the two in step.
+        ("boot-args", s("debug=0x14e -v -noprogress serial=3 cpus=1 kextlog=0xfff keepsyms=1 exe_boothash_salt=0")),
         # IOKitBSDInit() (IOKit/IOKitBSDInit.cpp) reads this to find the root
         # media: it takes the UUID string here (at most 37 bytes) and waits for
         # an IOMedia whose UUID matches it to publish the "boot-uuid-media"

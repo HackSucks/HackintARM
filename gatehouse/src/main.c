@@ -52,7 +52,16 @@ static EFI_BOOT_SERVICES *BS;
  * display in the ADT), so display_size is 0, the loop condition never fails
  * and the assert(*delta >= 0) trap fires.  A real vmapple guest has a
  * paravirtualised display; we simply have nothing to draw on. */
-#define GH_CMD_LINE         "debug=0x14e -v -noprogress serial=1 cpus=1 kextlog=0xfff keepsyms=1 exe_boothash_salt=0"
+/* serial=: XNU's pexpert decode of the boot-arg into `serialmode`
+ * (osfmk/console/serial_protos.h) bit 0x01 = SERIALMODE_OUTPUT, 0x02 =
+ * SERIALMODE_INPUT, 0x08 = SERIALMODE_BASE_TTY.  Output alone gives the
+ * kernel's own printf and nothing else; SERIALMODE_INPUT is what starts
+ * serial_keyboard_init()'s polling thread (osfmk/console/serial_general.c),
+ * the only thing that ever feeds characters into the BSD console queue, and
+ * XNU only exposes hw.serialdebugmode -- the sysctl launchd reads to decide
+ * whether to load the serial console job -- when output *and* input are both
+ * set (bsd/kern/kern_mib.c).  With serial=1 there is no way in at all. */
+#define GH_CMD_LINE         "debug=0x14e -v -noprogress serial=3 cpus=1 kextlog=0xfff keepsyms=1 exe_boothash_salt=0"
 
 /* ------------------------------------------------------------------ */
 
@@ -148,8 +157,12 @@ static EFI_FILE_PROTOCOL *open_root(void)
 	return 0;
 }
 
-/* Read a whole file into a freshly allocated pool buffer. */
-static void *read_file(EFI_FILE_PROTOCOL *root, const CHAR16 *path, u64 *out_size)
+/* Read a whole file into a freshly allocated pool buffer.  `quiet` exists for
+ * the optional handover files (the ramdisk, the second trust cache): an
+ * ordinary boot legitimately has neither, and "open failed" for every one of
+ * them would bury the lines that matter. */
+static void *read_file_opt(EFI_FILE_PROTOCOL *root, const CHAR16 *path,
+    u64 *out_size, int quiet)
 {
 	EFI_FILE_PROTOCOL *f;
 	EFI_GUID info_id = EFI_FILE_INFO_ID;
@@ -161,9 +174,11 @@ static void *read_file(EFI_FILE_PROTOCOL *root, const CHAR16 *path, u64 *out_siz
 
 	s = root->Open(root, &f, (CHAR16 *)path, EFI_FILE_MODE_READ, 0);
 	if (EFI_ERROR(s)) {
-		puts_("open failed: ");
-		print_ucs2(path);
-		gh_loghex(" status ", s);
+		if (!quiet) {
+			puts_("open failed: ");
+			print_ucs2(path);
+			gh_loghex(" status ", s);
+		}
 		return 0;
 	}
 	/* query size */
@@ -199,6 +214,12 @@ static void *read_file(EFI_FILE_PROTOCOL *root, const CHAR16 *path, u64 *out_siz
 	}
 	f->Close(f);
 	return buf;
+}
+
+static void *read_file(EFI_FILE_PROTOCOL *root, const CHAR16 *path,
+    u64 *out_size)
+{
+	return read_file_opt(root, path, out_size, 0);
 }
 
 /* ------------------------------------------------------------------ */
@@ -314,6 +335,261 @@ static int make_range_executable(u64 base, u64 size)
 	return EFI_ERROR(s) ? -1 : 0;
 }
 
+/* ------------------------------------------------------------------ */
+
+static u32 rd32le(const u8 *p)
+{
+	return (u32)p[0] | (u32)p[1] << 8 | (u32)p[2] << 16 | (u32)p[3] << 24;
+}
+
+static void wr32le(u8 *p, u32 v)
+{
+	p[0] = (u8)(v & 0xff);
+	p[1] = (u8)((v >> 8) & 0xff);
+	p[2] = (u8)((v >> 16) & 0xff);
+	p[3] = (u8)((v >> 24) & 0xff);
+}
+
+/* Read one DER TLV.  IMG4 uses definite lengths only (short form or
+ * 0x81/0x82/0x83), which is all Apple emits and all we need. */
+static int der_next(const u8 **pp, const u8 *end, u8 *tag,
+    const u8 **val, u64 *len)
+{
+	const u8 *p = *pp;
+	u64 l;
+	unsigned n, i;
+
+	if (p >= end)
+		return -1;
+	*tag = *p++;
+	if (p >= end)
+		return -1;
+	l = *p++;
+	if (l & 0x80) {
+		n = (unsigned)(l & 0x7F);
+		if (n == 0 || n > 4 || (u64)(end - p) < n)
+			return -1;
+		l = 0;
+		for (i = 0; i < n; i++)
+			l = (l << 8) | *p++;
+	}
+	if (l > (u64)(end - p))
+		return -1;
+	*val = p;
+	*len = l;
+	*pp = p + l;
+	return 0;
+}
+
+/*
+ * Unwrap an IMG4 object of the given payload type ("trst" for a trust cache,
+ * "rdsk" for a restore ramdisk) to the payload iBoot verifies and hands to the
+ * kernel.  A file that is not an IMG4 wrapper is taken to be the payload
+ * itself, so a raw object works too.
+ */
+static int img4_payload(const u8 *file, u64 fsize, const char *type4,
+    const u8 **payload, u64 *plen)
+{
+	const u8 *p = file, *end = file + fsize, *v, *seq_end;
+	u8 tag;
+	u64 l;
+
+	if (fsize >= 4 && file[0] == 0x30 &&
+	    der_next(&p, end, &tag, &v, &l) == 0 && tag == 0x30) {
+		seq_end = v + l;
+		p = v;
+		/* "IM4P": the container type */
+		if (der_next(&p, seq_end, &tag, &v, &l) || tag != 0x16 ||
+		    l != 4 || gh_memcmp(v, "IM4P", 4))
+			return -1;
+		/* the payload type; only the one we asked for is accepted */
+		if (der_next(&p, seq_end, &tag, &v, &l) || tag != 0x16 ||
+		    l != 4 || gh_memcmp(v, type4, 4))
+			return -1;
+		/* the object's version string */
+		if (der_next(&p, seq_end, &tag, &v, &l) || tag != 0x16)
+			return -1;
+		/* the payload blob */
+		if (der_next(&p, seq_end, &tag, &v, &l) || tag != 0x04)
+			return -1;
+		*payload = v;
+		*plen = l;
+		return 0;
+	}
+	*payload = file;
+	*plen = fsize;
+	return 0;
+}
+
+/*
+ * Hand XNU the static trust caches, the way iBoot does.
+ *
+ * load_static_trust_cache() (bsd/kern/kern_trustcache.c) reads
+ * /chosen/memory-map/TrustCache as a { paddr, length } pair and treats that
+ * physical range as a trust_cache_offsets_t: a count followed by that many
+ * byte offsets to the individual cache modules.
+ *
+ *     u32 num_caches; u32 offsets[num_caches]; <modules>
+ *
+ * A module is the IMG4 payload itself (version, uuid, entry count, entries) --
+ * iBoot verifies the wrapper and the kernel never sees it.  The entry is
+ * published by the caller after this returns.
+ *
+ * Only offsets[0] is loaded as the *static* trust cache; the rest are
+ * "engineering" modules, which arm64 release kernels skip unless a boot-arg
+ * opens them up.  So the cache that matters goes first, and which one that is
+ * depends on what is about to become the root device: an ordinary boot runs
+ * the platform binaries, a rooted ramdisk runs the restore environment, and
+ * each is vouched for by a different cache (they are not interchangeable --
+ * both name individual cdhashes).
+ *
+ * The range has to sit *below* the kernel image, because arm_vm_prot_init()
+ * (osfmk/arm64/arm_vm_init.c) insists on it:
+ *
+ *     if (trustCacheRegion < segLOWEST) { ...EXTRADATA... }
+ *     else { panic("TrustCache region is in an unexpected place"); }
+ *
+ * on release kernels, where segLOWEST is the kernel collection's mach header.
+ * That is also the window iBoot describes in boot_args: physBase/virtBase name
+ * the bottom of the boot data, not the kernel, and start.s moves both up to
+ * the mach header for its own bootstrap mapping.  So the cache is allocated
+ * immediately below the image, and the caller lowers the boot_args window base
+ * to cover it.
+ */
+static int load_trust_cache(EFI_FILE_PROTOCOL *root, u64 img, int ramdisk_root,
+    u64 *out_phys, u64 *out_len)
+{
+	/*
+	 * Ordered by what will be the root device; see above.  The IMG4 payload
+	 * type differs between the two: AppleImage4 wraps the platform's static
+	 * cache as "trst" (trust cache) but the one generated for a restore
+	 * ramdisk as "rtsc".  Both unwrap to the same trust_cache_offsets_t
+	 * module, so only the wrapper matters.
+	 */
+	static const CHAR16 *paths[2] = {
+		L"\\gatehouse\\ramdisktc",
+		L"\\gatehouse\\trustcache",
+	};
+	static const char *types[2] = { "rtsc", "trst" };
+	const u8 *payload[2];
+	u64 plen[2];
+	int i, j, n = 0;
+	u64 hdr, need, base, off;
+	u8 *dst;
+
+	for (i = 0; i < 2; i++) {
+		/* Module 0 is the static cache: the ramdisk's when it is going
+		 * to be the root device, the platform's otherwise. */
+		int k = (i == 0) ? (ramdisk_root ? 0 : 1)
+		    : (ramdisk_root ? 1 : 0);
+		u8 *file;
+		u64 fsize = 0;
+		u32 ver, count, esz;
+
+		file = read_file_opt(root, paths[k], &fsize, 1);
+		if (!file) {
+			continue;
+		}
+		if (img4_payload((const u8 *)file, fsize, types[k],
+		    &payload[n], &plen[n]) != 0 || plen[n] < 24) {
+			gh_log("trust cache     : not an IMG4 trust cache object\n");
+			continue;
+		}
+		ver = rd32le(payload[n]);
+		count = rd32le(payload[n] + 20);
+		esz = (ver == 1) ? 22 : (ver == 2) ? 24 : 0;
+		if (!esz || 24 + (u64)count * esz != plen[n]) {
+			gh_loghex("trust cache     : unsupported object ", ver);
+			continue;
+		}
+		gh_loghex(k ? "trust cache     : platform entries "
+		    : "trust cache     : ramdisk entries ", count);
+		n++;
+	}
+	if (!n) {
+		gh_log("trust cache     : not provided\n");
+		return -1;
+	}
+
+	/* num_caches, then one u32 offset per module, then the modules
+	 * themselves, each aligned so its version field is naturally aligned. */
+	hdr = 4 + 4 * (u64)n;
+	need = hdr;
+	for (i = 0; i < n; i++) {
+		need = (need + 7) & ~7ULL;
+		need += plen[i];
+	}
+	*out_len = need;
+	need = (need + GH_PAGE - 1) & ~(GH_PAGE - 1);
+
+	/*
+	 * Walk down from just below the image until the firmware lets us have
+	 * the pages.  The steps are one L2 block, so the window base stays close
+	 * to the kernel: arm_vm_prot_init() maps [physBase, segLOWEST) with the
+	 * bootstrap L1 table, which only exists for the kernel's own gigabyte.
+	 */
+	base = (img - need) & ~(GH_PAGE - 1);
+	for (j = 0; j < 32; j++, base -= GH_BOOT_L2_BLOCK) {
+		EFI_PHYSICAL_ADDRESS pa = base;
+
+		if (!EFI_ERROR(BS->AllocatePages(2 /* AllocateAddress */,
+		    2 /* EfiLoaderData */, need / GH_EFI_PAGE, &pa))) {
+			break;
+		}
+	}
+	if (j == 32) {
+		gh_log("trust cache     : no free pages below the image\n");
+		return -1;
+	}
+
+	dst = (u8 *)base;
+	gh_memset(dst, 0, need);
+	wr32le(dst, (u32)n);
+	off = hdr;
+	for (i = 0; i < n; i++) {
+		off = (off + 7) & ~7ULL;
+		wr32le(dst + 4 + 4 * (u64)i, (u32)off);
+		gh_memcpy(dst + off, payload[i], plen[i]);
+		off += plen[i];
+	}
+
+	gh_loghex("trust cache     : ", base);
+	gh_loghex("trust cache len : ", *out_len);
+	gh_uart_puts("trust cache mods: ");
+	gh_uart_putdec((u64)n);
+	nl();
+	*out_phys = base;
+	return 0;
+}
+
+
+/*
+ * iBoot's other handover for a restore boot: the ramdisk.  Returns the
+ * payload (the APFS container) and its length, or 0 when the ESP has none.
+ *
+ * XNU's IOKitBSDInit turns /chosen/memory-map/RAMDisk into /dev/md0, and the
+ * boot argument "rd=md0" makes that the root device (bsd_rooted_ramdisk(),
+ * bsd/kern/bsd_init.c) -- which also routes around the whole root-volume
+ * authentication path.  The bytes themselves are copied into the boot window
+ * by load_and_jump(); see the layout comment there for why they have to live
+ * inside it.
+ */
+static u64 read_ramdisk(EFI_FILE_PROTOCOL *root, const u8 **payload)
+{
+	u64 fsize = 0, plen = 0;
+	u8 *file = read_file_opt(root, L"\\gatehouse\\ramdisk", &fsize, 1);
+
+	if (!file) {
+		return 0;
+	}
+	if (img4_payload((const u8 *)file, fsize, "rdsk", payload, &plen) != 0 ||
+	    plen < GH_PAGE) {
+		gh_log("ramdisk         : not an IMG4 rdsk object\n");
+		return 0;
+	}
+	return plen;
+}
+
 static int load_and_jump(void)
 {
 	EFI_FILE_PROTOCOL *root;
@@ -327,6 +603,9 @@ static int load_and_jump(void)
 	u64 dt_phys, ba_phys, top_of_kernel;
 	u8 *p;
 	u64 ram_base = 0, ram_top = 0;
+	u64 tc_phys = 0, tc_len = 0;
+	const u8 *rd_payload = 0;
+	u64 rd_len = 0, rd_off = 0;
 
 	root = open_root();
 	if (!root) {
@@ -361,11 +640,18 @@ static int load_and_jump(void)
 	 * topOfKernelData belongs to the kernel" rule keeps the panic region
 	 * alive:
 	 *
-	 *   [image][device tree][boot_args] ... [embedded panic log]
+	 *   [trust cache][image][device tree][boot_args] ... [panic log][ramdisk]
 	 *
 	 * The panic region sits at a fixed offset from the image base because
 	 * build_adt.py bakes its address into /pram (XNU reads it there); the
 	 * check below fails loudly if the two ever drift apart.
+	 *
+	 * A restore ramdisk, when the ESP carries one, goes above the panic log
+	 * and inside the same window: arm_vm_physmap_init() maps everything from
+	 * end_kern up to topOfKernelData in one go -- "Device Tree (if not
+	 * locked down), RAM Disk (if present), bootArgs" -- and hands only what
+	 * is above topOfKernelData to the VM layer.  A ramdisk anywhere else is
+	 * free memory that the allocator reissues underneath the guest.
 	 */
 	span = (m.text_size + GH_PAGE - 1) & ~(GH_PAGE - 1);
 	dt_off = span;
@@ -377,6 +663,11 @@ static int load_and_jump(void)
 		return -1;
 	}
 	top_off = (panic_off + GH_PANIC_SIZE + GH_PAGE - 1) & ~(GH_PAGE - 1);
+	rd_len = read_ramdisk(root, &rd_payload);
+	if (rd_len) {
+		rd_off = top_off;
+		top_off = (rd_off + rd_len + GH_PAGE - 1) & ~(GH_PAGE - 1);
+	}
 	/*
 	 * AllocatePages() counts 4 KiB pages whatever the CPU's translation
 	 * granule is, so the count must use GH_EFI_PAGE.  GH_PAGE stays in the
@@ -416,6 +707,11 @@ static int load_and_jump(void)
 		return -1;
 	}
 	gh_loghex("top of kernel   : ", top_of_kernel);
+	if (rd_len) {
+		gh_memcpy((u8 *)img + rd_off, rd_payload, rd_len);
+		gh_loghex("ramdisk         : ", img + rd_off);
+		gh_loghex("ramdisk size    : ", rd_len);
+	}
 
 	/*
 	 * Complete the load.  An ordinary kernel is linked but not relocated:
@@ -443,6 +739,42 @@ static int load_and_jump(void)
 	}
 
 	/*
+	 * Bring-up handover (see patch.c): an optional one-line file on the
+	 * ESP naming the program to run as PID 1.  Present only while a machine
+	 * is being brought up -- a complete root volume does not need it -- and
+	 * absent by default, so an ordinary boot runs launchd.
+	 */
+	{
+		char init[64];
+		u64 fsize = 0;
+		u8 *file = read_file(root, L"\\gatehouse\\init", &fsize);
+
+		if (file) {
+			u64 n = 0;
+
+			while (n < fsize && (file[n] == ' ' || file[n] == '\t')) {
+				n++;
+			}
+			gh_memcpy(init, file, fsize - n < sizeof(init) - 1 ?
+			    fsize - n : sizeof(init) - 1);
+			init[fsize - n < sizeof(init) - 1 ? fsize - n :
+			    sizeof(init) - 1] = 0;
+			for (n = 0; init[n] && init[n] != '\n' &&
+			    init[n] != '\r'; n++) {
+			}
+			init[n] = 0;
+			if (n) {
+				gh_log("init override   : ");
+				gh_log(init);
+				nl();
+				gh_loghex("init override   : ",
+				    (u64)gh_patch_init_program((u8 *)img, span,
+				    &m, init));
+			}
+		}
+	}
+
+	/*
 	 * The device tree, in Apple's encoding (see dt/build_adt.py): XNU's
 	 * pexpert parses boot_args->deviceTreeP as an ADT, not as a .dtb.
 	 */
@@ -462,6 +794,51 @@ static int load_and_jump(void)
 		dt_phys = 0;
 	}
 
+	/*
+	 * iBoot's other job for the kernel's trust caches: find the static cache
+	 * the boot chain is willing to vouch for, put it in memory below
+	 * topOfKernelData, and publish its range in /chosen/memory-map.  XNU's
+	 * load_static_trust_cache() reads exactly that property; without it
+	 * AMFI rejects every platform binary (launchd included).
+	 */
+	if (dtsize) {
+		if (load_trust_cache(root, img, rd_len != 0,
+		    &tc_phys, &tc_len) == 0) {
+			u64 range[2];
+
+			range[0] = tc_phys;
+			range[1] = tc_len;
+			if (gh_adt_add_property((u8 *)dt_phys, GH_DT_MAX,
+			    "chosen/memory-map", "TrustCache", range,
+			    sizeof(range), &dtsize) == 0) {
+				gh_loghex("memory-map      : TrustCache ", tc_phys);
+				gh_loghex("memory-map      : length ", tc_len);
+			} else {
+				gh_log("memory-map      : could not publish TrustCache\n");
+			}
+		}
+
+		/*
+		 * A restore ramdisk is handed over the same way: a { paddr,
+		 * length } pair that IOKitBSDInit turns into /dev/md0 before
+		 * the root device is picked.
+		 */
+		if (rd_len) {
+			u64 range[2];
+
+			range[0] = img + rd_off;
+			range[1] = rd_len;
+			if (gh_adt_add_property((u8 *)dt_phys, GH_DT_MAX,
+			    "chosen/memory-map", "RAMDisk", range,
+			    sizeof(range), &dtsize) == 0) {
+				gh_loghex("memory-map      : RAMDisk ", range[0]);
+				gh_loghex("memory-map      : length ", rd_len);
+			} else {
+				gh_log("memory-map      : could not publish RAMDisk\n");
+			}
+		}
+	}
+
 	/* boot args */
 	ba_phys = img + ba_off;
 	scan_memory(&ram_base, &ram_top);
@@ -474,6 +851,16 @@ static int load_and_jump(void)
 	}
 	{
 		/*
+		 * The boot_args window starts at the bottom of the boot data,
+		 * not at the kernel: start.s moves both bases up to the mach
+		 * header before it builds the bootstrap mapping, so the kernel's
+		 * own addresses are unaffected, while the trust cache -- which
+		 * arm_vm_prot_init() only accepts below segLOWEST -- is inside
+		 * the physical aperture it maps.
+		 */
+		u64 win_base = tc_len ? tc_phys : img;
+		u64 win_virt = m.link_base - (img - win_base);
+		/*
 		 * deviceTreeP is a *virtual* address, as it is on Apple
 		 * hardware: XNU dereferences it directly once its bootstrap
 		 * KVA mapping is live, and SecureDTIsLockedDown() decides
@@ -481,11 +868,10 @@ static int load_and_jump(void)
 		 * kvtophys(deviceTreeP) against kvtophys(&_mh_execute_header).
 		 * Handing over a physical address there makes that comparison
 		 * meaningless (it reads as "locked down", which puts the tree
-		 * in EXTRADATA and makes arm_vm_prot_init() treat segLOWEST,
-		 * and therefore the length of the first arm_vm_physmap_slide()
-		 * region, as an enormous value).
+		 * in EXTRADATA, and then requires the trust cache to sit
+		 * immediately after it).
 		 */
-		u64 dt_va = m.link_base + (dt_phys - img);
+		u64 dt_va = win_virt + (dt_phys - win_base);
 		/*
 		 * topOfKernelData must cover every byte of boot data: the
 		 * kernel maps [end_kern, topOfKernelData) read-write, slides
@@ -502,32 +888,56 @@ static int load_and_jump(void)
 		 *   assert((temp_ptov_table[ptov_index-1].va +
 		 *           temp_ptov_table[ptov_index-1].len) <= physmap_end)
 		 *
-		 * works out to "adj0 + L0 + ((D - L0) % TWIG) - D <= 0", where D
-		 * is topOfKernelData - physBase and adj0 is the block-alignment
-		 * shift of the window (0..TWIG-1).  With our degenerate first
-		 * slice (L0 = segLOWEST - virtBase = 0) that only holds when
-		 * D >= TWIG (32 MiB), which the panic region already guarantees:
-		 * panic_off is 88 MiB.  Larger D only makes the inequality
-		 * easier, so the layout above is what decides.
+		 * works out to "adj0 + L0 + ((D - L0) % TWIG) - D <= 0", where
+		 * D is topOfKernelData - physBase, L0 is the boot data below
+		 * the kernel (segLOWEST - virtBase) and adj0 is the
+		 * block-alignment shift of the window (0..TWIG-1).  Since
+		 * D - L0 is topOfKernelData - img, i.e. the 88 MiB from
+		 * GH_PANIC_OFF, the inequality holds whatever the window base
+		 * is; with no trust cache it degenerates to D >= TWIG.
 		 */
 		u64 top_of_boot = img + top_off;
+		/*
+		 * A rooted ramdisk has no other way in: it is the restore
+		 * environment, it keeps /etc and /var on itself, and launchd's
+		 * single-user shell on /dev/console is what puts us at a
+		 * prompt.  Both flags belong to the handover, so an ordinary
+		 * boot leaves GH_CMD_LINE alone.
+		 */
+		char cmdline[sizeof(GH_CMD_LINE) + 16];
+		const char *suffix = " rd=md0 -s";
+		u64 ci, cn = 0;
 		int sz;
+
+		for (ci = 0; GH_CMD_LINE[ci]; ci++) {
+			cmdline[cn++] = GH_CMD_LINE[ci];
+		}
+		if (rd_len) {
+			for (ci = 0; suffix[ci]; ci++) {
+				cmdline[cn++] = suffix[ci];
+			}
+		}
+		cmdline[cn] = 0;
 
 		/* The panic region the ADT advertises must be where we expect
 		 * the image to be, must not collide with the image, device
-		 * tree or boot_args, and must stay inside topOfKernelData. */
+		 * tree, boot_args or trust cache, and must stay inside
+		 * topOfKernelData. */
 		if (img + panic_off != GH_PANIC_PHYS ||
 		    GH_PANIC_PHYS < img + boot_off ||
+		    (tc_len && GH_PANIC_PHYS < tc_phys + tc_len) ||
 		    GH_PANIC_PHYS + GH_PANIC_SIZE > top_of_boot) {
 			gh_uart_puts("bad panic region placement\n");
 			return 1;
 		}
 		gh_loghex("panic region    : ", GH_PANIC_PHYS);
 
+		gh_loghex("kernel window   : ", win_base);
+		gh_loghex("kernel window VA: ", win_virt);
 		gh_loghex("device tree VA  : ", dt_va);
-		sz = gh_bootargs_build((void *)ba_phys, m.link_base, img,
-		    ram_top - img, top_of_boot, dt_va, (u32)dtsize,
-		    GH_CMD_LINE);
+		sz = gh_bootargs_build((void *)ba_phys, win_virt, win_base,
+		    ram_top - win_base, top_of_boot, dt_va, (u32)dtsize,
+		    cmdline);
 		gh_uart_puts("boot_args size  : ");
 		gh_uart_putdec((u64)sz);
 		nl();
