@@ -606,6 +606,7 @@ static int load_and_jump(void)
 	u64 tc_phys = 0, tc_len = 0;
 	const u8 *rd_payload = 0;
 	u64 rd_len = 0, rd_off = 0;
+	int init_arg = 0;
 
 	root = open_root();
 	if (!root) {
@@ -771,6 +772,50 @@ static int load_and_jump(void)
 				    (u64)gh_patch_init_program((u8 *)img, span,
 				    &m, init));
 			}
+			if (n) {
+				/*
+				 * XNU gives PID 1 one argument, and only when
+				 * RB_SINGLE is set.  A rescue shell wants a
+				 * path there ("sh /dev/console"), so that it
+				 * opens the console itself -- PID 1 starts
+				 * with no descriptors, so nothing else can
+				 * read the console for it.
+				 */
+				char initarg[64];
+				u64 asize = 0;
+				u8 *afile = read_file_opt(root,
+				    L"\\gatehouse\\initarg", &asize, 1);
+
+				if (afile) {
+					u64 k = 0;
+
+					while (k < asize && (afile[k] == ' ' ||
+					    afile[k] == '\t')) {
+						k++;
+					}
+					gh_memcpy(initarg, afile,
+					    asize - k < sizeof(initarg) - 1 ?
+					    asize - k : sizeof(initarg) - 1);
+					initarg[asize - k < sizeof(initarg) - 1 ?
+					    asize - k : sizeof(initarg) - 1] = 0;
+					for (k = 0; initarg[k] &&
+					    initarg[k] != '\n' &&
+					    initarg[k] != '\r'; k++) {
+					}
+					initarg[k] = 0;
+					if (k) {
+						gh_log("init argument   : ");
+						gh_log(initarg);
+						nl();
+						init_arg =
+						    gh_patch_init_argument(
+						    (u8 *)img, span, top_off,
+						    &m, initarg, boot_off);
+						gh_loghex("init argument   : ",
+						    (u64)init_arg);
+					}
+				}
+			}
 		}
 	}
 
@@ -901,11 +946,13 @@ static int load_and_jump(void)
 		 * A rooted ramdisk has no other way in: it is the restore
 		 * environment, it keeps /etc and /var on itself, and launchd's
 		 * single-user shell on /dev/console is what puts us at a
-		 * prompt.  Both flags belong to the handover, so an ordinary
-		 * boot leaves GH_CMD_LINE alone.
+		 * prompt.  An init override that also names an argument needs
+		 * RB_SINGLE for the same reason: it is the only thing that
+		 * makes XNU pass a second argv entry to PID 1.  Both belong to
+		 * the handover, so an ordinary boot leaves GH_CMD_LINE alone.
 		 */
 		char cmdline[sizeof(GH_CMD_LINE) + 16];
-		const char *suffix = " rd=md0 -s";
+		const char *suffix = "";
 		u64 ci, cn = 0;
 		int sz;
 
@@ -913,9 +960,12 @@ static int load_and_jump(void)
 			cmdline[cn++] = GH_CMD_LINE[ci];
 		}
 		if (rd_len) {
-			for (ci = 0; suffix[ci]; ci++) {
-				cmdline[cn++] = suffix[ci];
-			}
+			suffix = " rd=md0 -s";
+		} else if (init_arg) {
+			suffix = " -s";
+		}
+		for (ci = 0; suffix[ci]; ci++) {
+			cmdline[cn++] = suffix[ci];
 		}
 		cmdline[cn] = 0;
 

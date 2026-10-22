@@ -639,12 +639,211 @@ int gh_patch_init_program(u8 *img, u64 span, const gh_macho *m,
 	return 1;
 }
 
+/*
+ * gh_patch_init_argument - choose what PID 1 gets as its one argument.
+ *
+ * load_init_program_at_path() copies the init program's path to the scratch
+ * page as argv[0], and -- only when RB_SINGLE is set -- a second string as
+ * argv[1].  XNU ships that second string as "-s" and bounds it to three
+ * characters ("cmp xN, #4"), so a shell starts with nowhere to read from:
+ * PID 1 is created without file descriptors, and "-s" means "read a script
+ * from stdin".
+ *
+ * A rescue shell wants a path there instead.  "sh /dev/console" makes the
+ * shell open the console itself and read its commands from it, which is the
+ * only way to reach a prompt without a descriptor of our own; the first line
+ * typed can then be "exec >/dev/console 2>&1" and the rest of the session is
+ * ordinary.  So re-point the argument's adrp+add at the replacement string
+ * and widen the bound to fit it.  Nothing else about init changes.
+ *
+ * Locator: the "add xN, x0, #1; cmp xN, #4" pair that bounds the argument is
+ * unique in the whole collection (it is the only place that bounds a strlen
+ * result to four).  That comparison is not a bespoke length check: it is the
+ * inlined __copyout_chk() test for the copyout() of the "-s" literal, whose
+ * compile-time object size is three.  The string about to be copied is the
+ * adrp+add pair in the window just before it, and must read "-s"; anything
+ * else is a shape this patch does not understand, and it refuses.
+ *
+ * The replacement cannot be one of the kernel's own strings: the image has no
+ * NUL-terminated "/dev/console" (the one that exists is inside a packed
+ * string table), so the caller reserves a slot for it in the loaded window,
+ * outside the image, and passes its offset.  This writes the bytes too, so
+ * there is a single place that decides what PID 1 receives.
+ */
+int gh_patch_init_argument(u8 *img, u64 span, u64 win, const gh_macho *m,
+    const char *arg, u64 arg_off)
+{
+	u64 delta = kc_link_delta(m);
+	u64 site = (u64)-1, pair = (u64)-1, i, n;
+	u32 reg = 0, pair_reg = 0, w;
+	int found = 0;
+
+	if (delta == (u64)-1 || arg == 0 || arg[0] != '/') {
+		return 0;
+	}
+	n = gh_strlen(arg);
+	if (n == 0 || n + 1 > 0xfffu) {
+		return 0;
+	}
+	/* The string goes after the image and stays inside the window. */
+	if (arg_off < span || arg_off + n + 1 > win) {
+		return 0;
+	}
+
+	/* The one "add xN, x0, #1; cmp xN, #4" in the image. */
+	for (i = 0; i + 8 <= span; i += 4) {
+		u32 a = rd32(img + i);
+		u32 c = rd32(img + i + 4);
+		u32 r;
+
+		if ((a & 0xffc00000u) != 0x91000000u ||	/* add (immediate) */
+		    ((a >> 5) & 0x1fu) != 0u ||		/* from x0 ... */
+		    ((a >> 10) & 0xfffu) != 1u) {	/* ... plus one */
+			continue;
+		}
+		r = a & 0x1fu;
+		if (r == 31 || (c & 0xffc00000u) != 0xf1000000u ||	/* cmp */
+		    (c & 0x1fu) != 31u ||			/* xzr */
+		    ((c >> 5) & 0x1fu) != r ||
+		    ((c >> 10) & 0xfffu) != 4u) {
+			continue;
+		}
+		if (site != (u64)-1) {
+			return 0;
+		}
+		site = i;
+	}
+	if (site == (u64)-1) {
+		return 0;
+	}
+
+	/* ... and the "-s" its result is about to be bounds-checked against. */
+	i = site;
+	while (i >= 4 && site - i < 96) {
+		u64 page, t, hit;
+
+		i -= 4;
+		page = adrp_page(img, i, delta, &reg);
+		if (page == (u64)-1) {
+			continue;
+		}
+		t = adrp_add_target(img, i + 4, page, reg);
+		if (t == (u64)-1 || t < delta) {
+			continue;
+		}
+		hit = t - delta;
+		if (hit + 3 > span || img[hit] != '-' || img[hit + 1] != 's' ||
+		    img[hit + 2] != 0) {
+			continue;
+		}
+		if (found) {
+			return 0;
+		}
+		found = 1;
+		pair = i;
+		pair_reg = reg;
+	}
+	if (!found) {
+		return 0;
+	}
+
+	/* The replacement has to be in the image, and unambiguous. */
+	gh_memcpy(img + arg_off, arg, n + 1);
+
+	/* Re-point "adrp xN, <page>; add xN, xN, #<off>" at it. */
+	{
+		i64 off = (i64)((delta + arg_off) & PAGE_MASK) -
+		    (i64)((delta + pair) & PAGE_MASK);
+		u32 pages;
+
+		if (off & 0xfff) {
+			return 0;
+		}
+		off >>= 12;
+		if (off < -(1 << 20) || off >= (1 << 20)) {
+			return 0;
+		}
+		pages = (u32)(off & 0x1fffff);
+		w = 0x90000000u | (((pages >> 2) & 0x7ffffu) << 5) |
+		    ((pages & 3u) << 29) | pair_reg;
+		wr32(img + pair, w);
+		w = 0x91000000u | (((u32)((delta + arg_off) & 0xfff)) << 10) |
+		    (pair_reg << 5) | pair_reg;
+		wr32(img + pair + 4, w);
+	}
+
+	/*
+	 * Widen the bound to the replacement's length plus its NUL, plus one:
+	 * this is the inlined __copyout_chk() test, which panics when
+	 * "chk_size < len", and the compiler turned that into
+	 * "cmp len, #chk_size + 1; b.hs panic".
+	 */
+	w = rd32(img + site + 4);
+	w = (w & ~0xffc00u) | ((u32)(n + 2) << 10);
+	wr32(img + site + 4, w);
+
+	return 1;
+}
+
+/*
+ * image4 "ignition blob" sysctl.
+ *
+ * macOS 27 runs the Darwin Ignition Sequence before the first user process
+ * reaches main().  Its configuration step opens with
+ *
+ *	sysctlbyname("security.mac.img4.ignition_blob", ...)
+ *
+ * which AppleImage4 answers by asking the SEP for an Image4 blob and waiting
+ * for the answer (_darwin_trap_ignition_get_blob spins on a completion flag
+ * before it can copy the blob out).  There is no SEP behind this platform, so
+ * the answer never comes: the sysctl never returns, and since PID 1 is the only
+ * user process, userland stops dead before launchd ever runs.  The same call is
+ * the first thing every later process makes, so every one of them hangs there
+ * too.
+ *
+ * A machine where the blob genuinely is not available returns ENOENT from the
+ * handler, and dyld has an explicit path for that: it logs "ignition blob not
+ * available" and continues with the reduced attestation this platform can offer
+ * anyway.  We reach that path by taking the leaf out of the sysctl tree, which
+ * makes the name lookup itself fail with ENOENT.  The name is a single string
+ * literal referenced exactly once, by the sysctl_oid that registers the node, so
+ * renaming it cannot disturb the handler, the Mach trap that serves the same
+ * blob, or any other sysctl.
+ */
+static int patch_apple_image4_ignition_sysctl(u8 *img, u64 span)
+{
+	static const char name[] = "ignition_blob";
+	const u64 n = sizeof(name) - 1;
+	u64 hits = 0, off = 0, i;
+
+	for (i = 1; i + n + 1 <= span; i++) {
+		if (img[i - 1] != 0 || img[i + n] != 0) {
+			continue;
+		}
+		if (gh_memcmp(img + i, name, n) != 0) {
+			continue;
+		}
+		hits++;
+		off = i;
+	}
+	if (hits != 1) {
+		gh_log("ignition blob: sysctl leaf not unique, left alone\n");
+		return 0;
+	}
+	img[off + n - 1] = 'x';		/* "ignition_blob" -> "ignition_blox" */
+	gh_loghex("image4 ignition-blob sysctl masked at ", off);
+	return 1;
+}
+
 int gh_patch_kernel(u8 *img, u64 span, const gh_macho *m)
 {
 	int applied = 0;
 
 	/* Apple VM platform hypercalls (see above). */
 	applied += patch_apple_hypercalls(img, span);
+
+	/* Image4 ignition-blob sysctl (see above). */
+	applied += patch_apple_image4_ignition_sysctl(img, span);
 
 	/* IOPCIDevice::extendedFindPCICapability() fast path (see above). */
 	applied += patch_apple_pci_capability_search(img, span);

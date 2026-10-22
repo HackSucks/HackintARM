@@ -100,6 +100,17 @@ int gh_patch_kernel(u8 *img, u64 span, const gh_macho *m);
 int gh_patch_init_program(u8 *img, u64 span, const gh_macho *m,
     const char *path);
 
+/*
+ * Choose PID 1's single argument.  XNU ships "-s"; a rescue shell wants a
+ * path there instead, so that the shell opens the console itself.  The string
+ * is written to `arg_off`, an image-relative offset in the loaded window
+ * (outside the image, inside `win`), because the image has no suitable
+ * NUL-terminated one of its own.  Only meaningful when the command line sets
+ * RB_SINGLE ("-s").
+ */
+int gh_patch_init_argument(u8 *img, u64 span, u64 win, const gh_macho *m,
+    const char *arg, u64 arg_off);
+
 /* bootargs.c */
 int gh_bootargs_build(void *dst, u64 virt_base, u64 phys_base, u64 mem_size,
     u64 top_of_kernel_data, u64 dt_phys, u32 dt_len, const char *cmdline);
