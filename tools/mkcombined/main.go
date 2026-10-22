@@ -238,8 +238,16 @@ func main() {
 		specs = append(specs,
 			apfswrite.VolumeSpec{Name: "Macintosh HD", UUID: volUUID, Role: apfs.VolumeRoleSystem, VolumeGroupID: group, Root: root},
 			apfswrite.VolumeSpec{Name: "Macintosh HD - Data", Role: apfs.VolumeRoleData, VolumeGroupID: group, Root: dataSkeleton()},
+			// The per-install directory under /System/Volumes/Preboot is
+			// named by the value iBoot puts in /chosen/boot-uuid, which is
+			// what libignition uses as the "volume group uuid": it opens
+			// "<preboot mount>/<kern.bootuuid>".  This container carries no
+			// on-disk volume-group record (our writer has no support for
+			// one), so the kernel falls back to matching boot-uuid against
+			// the boot *volume* UUID and reports that as the group UUID.
+			// Name the directory accordingly.
 			apfswrite.VolumeSpec{Name: "Preboot", Role: apfs.VolumeRolePreboot, Root: &apfswrite.Entry{Children: []*apfswrite.Entry{
-				dirEntry(uuidString(group), dirEntry("boot"), dirEntry("cryptex1"), dirEntry("restore")),
+				dirEntry(uuidString(volUUID), dirEntry("boot"), dirEntry("cryptex1"), dirEntry("restore")),
 			}}},
 		)
 	}
