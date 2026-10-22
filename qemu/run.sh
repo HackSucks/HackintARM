@@ -45,6 +45,11 @@ EXTRA=("$@")
 # a boot that writes to it would have to be redone from the IPSW.
 ROOTIMG="${ROOTIMG:-/mnt/windows2/vmapple-rootfs/043-70867-635.dmg}"
 ROOTIMG_RO="${ROOTIMG_RO:-1}"
+# Container format of ROOTIMG.  A qcow2 overlay over the pristine raw image is
+# the writable-root setup: the guest gets a read-write disk (which is what
+# userland expects -- it mounts Preboot and Data read-write), while every write
+# lands in the sparse overlay and the 18 GiB base image is never modified.
+ROOTFMT="${ROOTFMT:-raw}"
 
 # The root volume's static trust cache (IMG4 "trst" member).  XNU needs it to
 # accept the platform binaries on that volume -- launchd first of all -- and
@@ -96,6 +101,13 @@ fi
 if [[ -n "${INIT:-}" ]]; then
   printf '%s\n' "$INIT" > "$ESP/gatehouse/init"
   echo "== PID 1 override: $INIT =="
+fi
+# ... and the one argument it gets, when it needs one.  "sh /dev/console" is
+# the rescue shell: PID 1 starts with no descriptors, so the shell has to open
+# the console itself.  Only meaningful alongside INIT.
+if [[ -n "${INITARG:-}" ]]; then
+  printf '%s\n' "$INITARG" > "$ESP/gatehouse/initarg"
+  echo "== PID 1 argument: $INITARG =="
 fi
 # Restore ramdisk handover: the IMG4 object as downloaded (Gatehouse unwraps the
 # "rdsk" payload) plus the trust cache generated for its contents.
@@ -156,11 +168,11 @@ QARGS=(
 )
 
 if [[ -n "$ROOTIMG" && -f "$ROOTIMG" ]]; then
-  echo "== attaching root volume: $ROOTIMG (ro=$ROOTIMG_RO) =="
+  echo "== attaching root volume: $ROOTIMG (ro=$ROOTIMG_RO fmt=$ROOTFMT) =="
   if [[ "$ROOTIMG_RO" == "1" ]]; then
-    QARGS+=(-drive "if=none,id=rootvol,format=raw,readonly=on,file=$ROOTIMG")
+    QARGS+=(-drive "if=none,id=rootvol,format=$ROOTFMT,readonly=on,file=$ROOTIMG")
   else
-    QARGS+=(-drive "if=none,id=rootvol,format=raw,file=$ROOTIMG")
+    QARGS+=(-drive "if=none,id=rootvol,format=$ROOTFMT,file=$ROOTIMG")
   fi
   QARGS+=(-device "virtio-blk-pci,drive=rootvol,disable-legacy=on")
 elif [[ -n "$ROOTIMG" ]]; then
@@ -169,6 +181,15 @@ fi
 
 if [[ "$USE_GDB" == "1" ]]; then
   QARGS+=(-gdb "tcp::$GDB_PORT")
+fi
+
+# HMP monitor on a unix socket, opt-in.  Used to read guest kernel memory from
+# the host (x/Ngx over HMP) while the guest is stuck, which is how the
+# userland stalls so far were diagnosed.  wait=off so QEMU does not block
+# waiting for a client before starting the machine.
+if [[ -n "${MONITOR:-}" ]]; then
+  rm -f "$MONITOR"
+  QARGS+=(-monitor "unix:$MONITOR,server=on,wait=off")
 fi
 
 # Console.  By default the guest's serial port is QEMU's stdio, so a boot is
