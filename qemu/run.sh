@@ -51,6 +51,15 @@ ROOTIMG_RO="${ROOTIMG_RO:-1}"
 # lands in the sparse overlay and the 18 GiB base image is never modified.
 ROOTFMT="${ROOTFMT:-raw}"
 
+# Auxiliary storage (the iSC container).  macOS 27's mount-phase-1 mounts
+# xART off a GPT partition whose type GUID is 69646961-6700-11AA-AA11-00306543ECAC
+# ("Content Hint" in IOKit terms) and treats its absence as fatal.  The image
+# built by tools/mkisc carries that partition and the iSCPreboot/xART/Hardware
+# volumes; a real Mac has the same partition on the same disk as the root
+# container.  Unset by default so an ordinary boot is unchanged.
+ISCIMG="${ISCIMG:-}"
+ISCFMT="${ISCFMT:-raw}"
+
 # The root volume's static trust cache (IMG4 "trst" member).  XNU needs it to
 # accept the platform binaries on that volume -- launchd first of all -- and
 # Gatehouse delivers it the way iBoot does: it loads the payload, puts it in
@@ -108,6 +117,12 @@ fi
 if [[ -n "${INITARG:-}" ]]; then
   printf '%s\n' "$INITARG" > "$ESP/gatehouse/initarg"
   echo "== PID 1 argument: $INITARG =="
+fi
+# Extra kernel boot arguments for a diagnostic run, one line.  Absent by
+# default, so an ordinary boot keeps Gatehouse's built-in command line.
+if [[ -n "${BOOTARGS:-}" ]]; then
+  printf '%s\n' "$BOOTARGS" > "$ESP/gatehouse/bootargs"
+  echo "== extra boot args: $BOOTARGS =="
 fi
 # Restore ramdisk handover: the IMG4 object as downloaded (Gatehouse unwraps the
 # "rdsk" payload) plus the trust cache generated for its contents.
@@ -177,6 +192,18 @@ if [[ -n "$ROOTIMG" && -f "$ROOTIMG" ]]; then
   QARGS+=(-device "virtio-blk-pci,drive=rootvol,disable-legacy=on")
 elif [[ -n "$ROOTIMG" ]]; then
   echo "== root volume $ROOTIMG not present; booting without a root disk =="
+fi
+
+# iSC (auxiliary storage): a second virtio-blk is just a carrier here.  The
+# guest finds the partition by its GPT type GUID, not by which disk it is on;
+# folding it into the root disk's GPT is the faithful layout, and is what a
+# machine that only passes one block device through needs.
+if [[ -n "$ISCIMG" && -f "$ISCIMG" ]]; then
+  echo "== attaching iSC volume: $ISCIMG (fmt=$ISCFMT) =="
+  QARGS+=(-drive "if=none,id=iscdisk,format=$ISCFMT,file=$ISCIMG")
+  QARGS+=(-device "virtio-blk-pci,drive=iscdisk,disable-legacy=on")
+elif [[ -n "$ISCIMG" ]]; then
+  echo "== iSC volume $ISCIMG not present; booting without auxiliary storage =="
 fi
 
 if [[ "$USE_GDB" == "1" ]]; then

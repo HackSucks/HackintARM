@@ -951,7 +951,42 @@ static int load_and_jump(void)
 		 * makes XNU pass a second argv entry to PID 1.  Both belong to
 		 * the handover, so an ordinary boot leaves GH_CMD_LINE alone.
 		 */
-		char cmdline[sizeof(GH_CMD_LINE) + 16];
+		/*
+		 * Bring-up handover: an optional one-line file on the ESP
+		 * with extra kernel boot arguments (ignition level, dyld
+		 * switches).  Absent by default, so an ordinary boot keeps
+		 * GH_CMD_LINE exactly as shipped; present only while a
+		 * diagnostic run needs a knob without rebuilding Gatehouse.
+		 */
+		char extra[160];
+		extra[0] = 0;
+		{
+			u64 bsize = 0;
+			u8 *bfile = read_file_opt(root,
+			    L"\\gatehouse\\bootargs", &bsize, 1);
+
+			if (bfile) {
+				u64 k = 0;
+
+				while (k < bsize && (bfile[k] == ' ' ||
+				    bfile[k] == '\t')) {
+					k++;
+				}
+				while (k < bsize && bfile[k] != '\n' &&
+				    bfile[k] != '\r' &&
+				    k < sizeof(extra) - 1) {
+					extra[k] = bfile[k];
+					k++;
+				}
+				extra[k] = 0;
+				if (extra[0]) {
+					gh_log("boot args extra : ");
+					gh_log(extra);
+					nl();
+				}
+			}
+		}
+		char cmdline[sizeof(GH_CMD_LINE) + 176];
 		const char *suffix = "";
 		u64 ci, cn = 0;
 		int sz;
@@ -966,6 +1001,12 @@ static int load_and_jump(void)
 		}
 		for (ci = 0; suffix[ci]; ci++) {
 			cmdline[cn++] = suffix[ci];
+		}
+		if (extra[0]) {
+			cmdline[cn++] = ' ';
+			for (ci = 0; extra[ci]; ci++) {
+				cmdline[cn++] = extra[ci];
+			}
 		}
 		cmdline[cn] = 0;
 
