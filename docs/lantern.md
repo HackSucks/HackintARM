@@ -141,17 +141,47 @@ handle are repeated here.
 
 ### 4.1 Devices and ADT
 
-Two nodes, two MMIO windows, two interrupts. VMApple's own machine places them
-at:
+The authentic VMApple tree is available as
+`kernel/DeviceTree.vma2macosap.adt`, so the contract is no longer a guess. The
+two nodes are:
 
-| Device | AVP physical | Size | AVP GIC id |
-|---|---|---|---|
-| `APV_GFX` (GPU) | `0x30200000` | 64 KiB | `0x11` |
-| `APV_IOSFC` (IOSurface) | `0x30210000` | 64 KiB | `0x10` |
+```
+/arm-io/gfx
+    compatible = "paravirtualizedgraphics,gpu"
+    role = "APV_GFX"
+    reg = <0x20200000 0x10000>
+    interrupts = <0x31 0>
+    interrupt-parent = <&gic>            ; phandle 0x39
+    AAPL,phandle = <0x42>
+    gpu-sysmem-reserve-percent = "syscfg/gsrp"
 
-The exact node names and properties still have to be copied from a real VMApple
-device tree (or derived from what the drivers read). The match strings and the
-provider class are known from the kexts:
+/arm-io/iosurface-mapper
+    compatible = "paravirtualizedgraphics,iosurface"
+    role = "APV_IOSFC"
+    reg = <0x20210000 0x10000>
+    interrupts = <0x30 0>
+    interrupt-parent = <&gic>            ; phandle 0x39
+    AAPL,phandle = <0x41>
+```
+
+Notes:
+
+- The values are little-endian cells in the ADT blob; `reg` is two 64-bit
+  values (address, size), and `interrupts` is two 32-bit cells (GIC id,
+  flags). The GIC ids are SPI 48 and 49, matching the `0x30`/`0x31` above.
+- The GPU phandle `0x42` and IOSurface phandle `0x41` are exactly Trestle's
+  `TRESTLE_PHANDLE_GFX` and `TRESTLE_PHANDLE_IOSURFACE_MAPPER`.
+- `gpu-sysmem-reserve-percent` is a `syscfg/...` reference in the authentic
+  tree; iBoot resolves it. A synthetic tree must either resolve it to a
+  concrete percentage or supply the property the driver reads after
+  resolution. This is the one property not yet pinned down.
+- A node that advertises something the device model does not back is worse
+  than no node: the driver maps it and faults on first access, which is how the
+  missing PL061 controller produced a synchronous external abort earlier in the
+  project. Publish these two only when the front-end is ready for the accesses
+  they invite.
+
+The match strings and provider class are known from the kexts:
 
 ```
 compatible        = "paravirtualizedgraphics,gpu"
@@ -160,17 +190,6 @@ IOMatchCategory   = IOAccelerator
 
 compatible        = "paravirtualizedgraphics,iosurface"
 ```
-
-A GPU node also needs its `reg`, `interrupts`, and whatever phandle wiring the
-IOSurface mapper uses. Trestle already reserves
-`TRESTLE_PHANDLE_IOSURFACE_MAPPER` (`0x41`); the node it points at, and the
-properties the guest reads from it, must be confirmed against a real tree before
-the first descriptor table is expected to work.
-
-**Do not invent properties.** A node that advertises something the device model
-does not back is worse than no node: the driver maps it and faults on first
-access, which is how the missing PL061 controller produced a synchronous
-external abort earlier in the project.
 
 ### 4.2 MMIO
 
@@ -387,7 +406,10 @@ in:
 - the QEMU device's placement.
 
 If the AVP's real offsets are used instead, the same rule applies: one machine
-description, three consumers.
+description, three consumers. The authentic AVP values are `0x20200000`
+(GPU) and `0x20210000` (IOSurface), with GIC ids 49 and 48; QEMU `virt` can
+publish them at those physical addresses too, as long as nothing else claims
+them.
 
 ### Guest RAM
 
@@ -566,10 +588,10 @@ AArch64 machine.
 
 ## 10. Open questions
 
-1. **Exact ADT properties.** The node names, `reg` encoding, `interrupts`
-   cells, IOSurface mapper phandle and any Apple-specific properties must be
-   copied from a real VMApple tree or derived from the drivers. Until then,
-   Phase 0 is a hypothesis, not a contract.
+1. **`gpu-sysmem-reserve-percent`.** The authentic tree names a `syscfg/gsrp`
+   reference rather than a number. How iBoot resolves it, and what the driver
+   does with the resolved value, still has to be pinned down. Every other ADT
+   property for the two nodes is known.
 2. **Feature level / binary version.** Which `feature_level` macOS 27's driver
    needs (62, 113, 209 or 245+) is not established. Start at 4 and lower it only
    if the guest misbehaves.
