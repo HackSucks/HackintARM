@@ -1,22 +1,12 @@
-# HackintARM
+# Bring-up log
 
-Boot Apple Silicon macOS on real AArch64 hardware — no QEMU `vmapple` machine
-model, no proprietary Apple hypervisor.
+This is the detailed narrative of the boot bring-up: every wall the project hit
+on the way from the first UART byte to `launchd`, and the evidence behind each
+fix. The top-level [`README.md`](../README.md) is the summary; this file keeps
+the long version so the reasoning does not have to be rediscovered.
 
-Two pieces:
-
-* **Gatehouse** — a freestanding UEFI bootloader (`gatehouse/`). It loads an
-  XNU kernel collection (an `MH_FILESET`), lays it out 1:1 flat, synthesises the
-  Apple Device Tree (ADT) that XNU expects, and hands control to the kernel. It
-  is machine-portable: the only thing that ties it to a board is the ADT it
-  builds (`gatehouse/dt/build_adt.py`).
-* **Trestle** — a hypervisor (`trestle/`, in progress). It provides the
-  virtualised platform the guest expects on hardware that does not implement
-  Apple's paravirtual AVP/CTRR interfaces directly.
-
-The near-term bring-up target is macOS 27 "Golden Gate" (VMApple kernel
-collection) running under Gatehouse on QEMU `virt`; the ultimate target is real
-bare-metal AArch64.
+The target is macOS 27 "Golden Gate" (VMApple kernel collection) running under
+Gatehouse on QEMU `virt`; the ultimate target is real bare-metal AArch64.
 
 ## Layout
 
@@ -46,14 +36,14 @@ overrides it; the image has to be a collection, not a bare kernel slice.
 `kernel/` is not distributed with this repo; extract the images from a
 legitimate Apple IPSW (`tools/ipsw_extract.py`, `tools/im4p_extract.py`). The
 restore image we use, its build identity, and the member map are in
-[`docs/ipsw.md`](docs/ipsw.md).
+[`docs/ipsw.md`](ipsw.md).
 
 ## Licence
 
 GPL-2.0-or-later for everything HackintARM authors; third-party Acidanthera
 kexts are GPL-3.0-or-later and combine with the core under GPLv3 terms. Linux
 `GPL-2.0-only` code is kept isolated. The full policy is in
-[`LICENSING.md`](LICENSING.md); the GPLv2 text is in [`LICENSE`](LICENSE).
+[`LICENSING.md`](../LICENSING.md); the GPLv2 text is in [`LICENSE`](../LICENSE).
 
 ## Status
 
@@ -146,7 +136,7 @@ The root volume itself is `043-70867-635.dmg.aea` in the IPSW. It is an AEA
 public PEM and an HPKE-wrapped key, so `tools/aea_decrypt.py` decrypts it while
 Range-fetching it from Apple's CDN, producing a raw APFS container
 (`NXSB`, 13.21 GiB) — the raw block device macOS wants. See
-[`docs/ipsw.md`](docs/ipsw.md).
+[`docs/ipsw.md`](ipsw.md).
 
 Next is that root device. The decrypted volume is a raw APFS container
 (`NXSB`, 13.21 GiB) and can be handed to the guest as a block device, but XNU

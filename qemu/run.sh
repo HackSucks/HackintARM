@@ -86,7 +86,7 @@ make -C "$GH" ${STALL:+STALL=$STALL} >/dev/null
 
 if [[ ! -f "$KERNEL" ]]; then
   echo "error: kernel image not found: $KERNEL" >&2
-  echo "       (extract one from an IPSW; see README.local.md)" >&2
+  echo "       (extract one from an IPSW; see docs/bringup.md)" >&2
   exit 1
 fi
 
