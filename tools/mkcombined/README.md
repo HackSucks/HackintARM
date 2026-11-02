@@ -26,8 +26,16 @@ toolkit (MIT).  `mkcombined` is the thin driver around its `apfswrite` package.
    The System volume keeps the source volume's UUID, because `/chosen/boot-uuid`
    in the generated ADT names it.
 
-The Data and Preboot volumes are created with only a skeleton (the firmlink
-targets macOS expects to find there), so the OS has somewhere to write.
+The Data and Preboot volumes are created from what a real install leaves
+behind.  The Data volume is populated from the installer's template,
+`/System/Library/Templates/Data` on the System volume, because daemons assume
+the template's directories exist: `/Library/Preferences` (logd creates
+`/Library/Preferences/Logging` there, and its sandbox profile allows only that
+subpath -- with the parent missing the `mkdir` fails with `EPERM` and logd
+traps), `/private/etc` (tzinit links `localtime` into it), the local directory
+service nodes `opendirectoryd` needs, and so on.  A few directories the system
+creates on first boot (`/private/var/db/diagnostics` and its stores,
+`/private/var/db/uuidtext`) are added on top of the template.
 
 ## Usage
 

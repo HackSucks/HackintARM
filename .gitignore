@@ -21,3 +21,6 @@ __pycache__/
 # QEMU / debugger scratch
 *.bin
 *.log
+
+# Go build output
+tools/mkcombined/mkcombined

@@ -137,6 +137,54 @@ func dirEntry(name string, kids ...*apfswrite.Entry) *apfswrite.Entry {
 	return &apfswrite.Entry{Name: name, Mode: os.ModeDir | 0755, ModeExplicit: true, UID: 0, GID: 0, Children: kids}
 }
 
+// ensureDir walks (and creates as needed) the slash-separated directory path
+// under root, returning the directory entry.
+func ensureDir(root *apfswrite.Entry, parts ...string) *apfswrite.Entry {
+	cur := root
+	for _, name := range parts {
+		var next *apfswrite.Entry
+		for _, e := range cur.Children {
+			if e.Name == name && e.Mode.IsDir() {
+				next = e
+				break
+			}
+		}
+		if next == nil {
+			next = dirEntry(name)
+			cur.Children = append(cur.Children, next)
+		}
+		cur = next
+	}
+	return cur
+}
+
+// dataRoot builds the Data volume's root.  A real install populates that
+// volume from the installer's template, /System/Library/Templates/Data, and
+// daemons assume the template's directories exist: /Library/Preferences (logd
+// creates /Library/Preferences/Logging and its sandbox profile allows only
+// that subpath, so a missing parent makes the mkdir fail with EPERM and logd
+// traps), /private/etc (tzinit links localtime into it), the local directory
+// service nodes opendirectoryd needs, and so on.  Use the template when the
+// source volume has one and only add the directories the system creates on
+// first boot on top of it.
+func dataRoot(w *walker) *apfswrite.Entry {
+	root := &apfswrite.Entry{}
+	const tmpl = "System/Library/Templates/Data"
+	if kids, err := w.children(tmpl); err == nil {
+		root.Children = kids
+		fmt.Fprintf(os.Stderr, "Data volume root from %s (%d entries)\n", tmpl, len(kids))
+	} else {
+		root = dataSkeleton()
+		fmt.Fprintf(os.Stderr, "no %s (%v); using the minimal Data skeleton\n", tmpl, err)
+	}
+	ensureDir(root, "private", "var", "db", "diagnostics")
+	ensureDir(root, "private", "var", "db", "diagnostics", "timesync")
+	ensureDir(root, "private", "var", "db", "uuidtext")
+	ensureDir(root, "private", "var", "db", "timezone")
+	ensureDir(root, "private", "etc")
+	return root
+}
+
 func dataSkeleton() *apfswrite.Entry {
 	return &apfswrite.Entry{Children: []*apfswrite.Entry{
 		dirEntry("private",
@@ -625,7 +673,7 @@ func main() {
 	} else {
 		specs = append(specs,
 			apfswrite.VolumeSpec{Name: "Macintosh HD", UUID: volUUID, Role: apfs.VolumeRoleSystem, VolumeGroupID: group, Root: root},
-			apfswrite.VolumeSpec{Name: "Macintosh HD - Data", Role: apfs.VolumeRoleData, VolumeGroupID: group, Root: dataSkeleton()},
+			apfswrite.VolumeSpec{Name: "Macintosh HD - Data", Role: apfs.VolumeRoleData, VolumeGroupID: group, Root: dataRoot(w)},
 			// The per-install directory under /System/Volumes/Preboot is
 			// named by the value iBoot puts in /chosen/boot-uuid, which is
 			// what libignition uses as the "volume group uuid": it opens
