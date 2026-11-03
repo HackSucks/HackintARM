@@ -405,20 +405,34 @@ carry over to the real machine.
 
 ### Device windows
 
-Use the authentic AVP addresses rather than inventing new ones:
+The authentic AVP addresses are physical `0x30200000` (gfx) and `0x30210000`
+(iosurface-mapper). Care is needed when reading them out of the tree: the ADT's
+`reg` fields are **SoC-relative**, not physical. The reference tree says
+`reg = <0x20200000 0x10000>` from a `0x10000000` SoC base, and QEMU's own
+`vmapple` machine maps the result, `0x30200000`, in `hw/arm/vmapple.c`.
 
-| Device | Physical | Size | GIC id |
+| Device | Authentic physical | Size | GIC id |
 |---|---|---|---|
-| `gfx` (`paravirtualizedgraphics,gpu`) | `0x20200000` | 64 KiB | SPI 0x31 (49) |
-| `iosurface-mapper` (`paravirtualizedgraphics,iosurface`) | `0x20210000` | 64 KiB | SPI 0x30 (48) |
+| `gfx` (`paravirtualizedgraphics,gpu`) | `0x30200000` | 64 KiB | `0x31` (SPI 17) |
+| `iosurface-mapper` (`paravirtualizedgraphics,iosurface`) | `0x30210000` | 64 KiB | `0x30` (SPI 16) |
+
+The address is a machine-description value, so the QEMU `virt` bring-up moves
+the two windows to `0x0B000000`/`0x0B010000`: the authentic addresses fall
+inside `virt`'s PCIe MMIO32 window, where UEFI places BARs, while `0x0B...` is
+unused peripheral space. That is the *only* difference; the ADT contract, the
+guest driver and the front-end are identical.
 
 They must be identical in three places, from one definition:
 
-- `gatehouse/dt/build_adt.py` (the ADT nodes);
+- `gatehouse/dt/build_adt.py` (`LANTERN_GFX_PHYS`/`LANTERN_IOSFC_PHYS` and the
+  opt-in `--lantern` nodes);
 - `trestle/src/machines.c` (the machine windows);
-- the stage-2 trap configuration Trestle installs before `eret` to XNU.
+- the stage-2 trap configuration Trestle installs before `eret` to XNU
+  (`GH_LANTERN_*` in `gatehouse/include/gh.h`).
 
-Nothing else in QEMU `virt` claims these addresses.
+The nodes are opt-in (`LANTERN=1` in `qemu/run.sh`) so that the default tree,
+and therefore the rest of the boot, is unchanged until the front-end can
+answer.
 
 ### Guest RAM
 

@@ -98,7 +98,11 @@ if [[ ! -f "$KERNEL" ]]; then
 fi
 
 echo "== building device tree =="
-python3 "$GH/dt/build_adt.py" -o "$ROOT/build/gatehouse.adt"
+LANTERN_ARG=""
+if [[ "${LANTERN:-0}" == "1" ]]; then
+  LANTERN_ARG="--lantern"
+fi
+python3 "$GH/dt/build_adt.py" -o "$ROOT/build/gatehouse.adt" $LANTERN_ARG
 
 echo "== staging ESP =="
 rm -rf "$ESP"

@@ -71,16 +71,16 @@ gh_el2_vectors:
 
 /*
  * Synchronous trap from the guest.  The guest's general-purpose registers are
- * not banked, so save every one the C ABI may clobber plus LR, hand the C
- * handler the syndrome, the preferred return address and a pointer to the
- * saved frame, then resume the guest at the address it returns.
+ * not banked, so save every one, hand the C handler the syndrome, the fault
+ * addresses, the preferred return address and a pointer to the saved frame,
+ * then resume the guest at the address it returns.
  *
- * Frame (16-byte aligned, 176 bytes):
- *   0    x0      x1      ...   x18     x29     x30
- *   ^ regs[0] is the value the handler leaves as the guest's x0.
+ * Frame (16-byte aligned, 256 bytes): x0..x30 at 8-byte slots 0..30.
+ *   ^ regs[0] is the value the handler leaves as the guest's x0; MMIO
+ *     emulation indexes the same frame by the syndrome's Rt field.
  */
 gh_el2_sync:
-	sub	sp, sp, #176
+	sub	sp, sp, #256
 	stp	x0, x1, [sp, #0]
 	stp	x2, x3, [sp, #16]
 	stp	x4, x5, [sp, #32]
@@ -90,12 +90,19 @@ gh_el2_sync:
 	stp	x12, x13, [sp, #96]
 	stp	x14, x15, [sp, #112]
 	stp	x16, x17, [sp, #128]
-	stp	x18, x29, [sp, #144]
-	str	x30, [sp, #160]
+	stp	x18, x19, [sp, #144]
+	stp	x20, x21, [sp, #160]
+	stp	x22, x23, [sp, #176]
+	stp	x24, x25, [sp, #192]
+	stp	x26, x27, [sp, #208]
+	stp	x28, x29, [sp, #224]
+	str	x30, [sp, #240]
 
 	mrs	x0, esr_el2
-	mrs	x1, elr_el2
-	mov	x2, sp
+	mrs	x1, far_el2
+	mrs	x2, hpfar_el2
+	mrs	x3, elr_el2
+	mov	x4, sp
 	bl	gh_el2_trap_c
 	msr	elr_el2, x0
 
@@ -108,9 +115,14 @@ gh_el2_sync:
 	ldp	x12, x13, [sp, #96]
 	ldp	x14, x15, [sp, #112]
 	ldp	x16, x17, [sp, #128]
-	ldp	x18, x29, [sp, #144]
-	ldr	x30, [sp, #160]
-	add	sp, sp, #176
+	ldp	x18, x19, [sp, #144]
+	ldp	x20, x21, [sp, #160]
+	ldp	x22, x23, [sp, #176]
+	ldp	x24, x25, [sp, #192]
+	ldp	x26, x27, [sp, #208]
+	ldp	x28, x29, [sp, #224]
+	ldr	x30, [sp, #240]
+	add	sp, sp, #256
 	eret
 
 gh_el2_unexpected:

@@ -114,7 +114,8 @@ gh_jump_to_kernel:
 	isb
 
 	/*
-	 * Trestle's EL2 state.  Stage 2 is off for now (VM=0), so
+	 * Trestle's EL2 state.  Stage 2 is installed later, in
+	 * gh_stage2_init, immediately before the eret; until then VM=0, so
 	 * guest-physical == physical.  Physical IRQ/FIQ/SError are routed to
 	 * EL1, FP/SIMD is not trapped, pointer authentication is enabled for
 	 * EL1 (API/APK; without them every PAC instruction at EL1 is
@@ -152,6 +153,14 @@ gh_jump_to_kernel:
 	 * An eret taken at EL2 uses ELR_EL2/SPSR_EL2; the target EL comes
 	 * from the SPSR mode field. */
 	msr	sp_el1, x2
+
+	/*
+	 * Stage 2: identity for RAM and the rest of device space, absent for
+	 * Lantern's two windows.  C preserves x19/x20 (entry and boot_args),
+	 * and SP_EL1 is already the guest's stack.
+	 */
+	bl	gh_stage2_init
+
 	adr	x6, .Lenter
 	msr	elr_el2, x6
 	mov	x6, #0x3c5		/* EL1h, D|A|I|F */

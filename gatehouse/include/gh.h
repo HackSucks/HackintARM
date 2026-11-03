@@ -39,8 +39,31 @@ u64   gh_current_el(void);
 void gh_el2_unexpected_c(u64 esr, u64 far, u64 elr, u64 spsr, u64 cel, u64 hcr);
 
 /* Lower-EL synchronous trap: returns the address to resume the guest at.
- * regs[0..18] are the guest's x0..x18 (regs[0] becomes its x0 on return). */
-u64 gh_el2_trap_c(u64 esr, u64 elr, u64 *regs);
+ * regs[0..30] are the guest's x0..x30 (regs[0] becomes its x0 on return).
+ * far is FAR_EL2, hpfar is HPFAR_EL2 (the faulting IPA's page for stage-2
+ * aborts). */
+u64 gh_el2_trap_c(u64 esr, u64 far, u64 hpfar, u64 elr, u64 *regs);
+
+/* stage2.c: the identity map, with Lantern's windows left out. */
+void gh_stage2_init(void);
+
+/* Lantern's device windows.  Stage 2 leaves
+ * [GFX_BASE, IOSFC_BASE + WINDOW_SIZE) unmapped, so every access to either
+ * 64 KiB window traps to Trestle.
+ *
+ * These are the bring-up machine's addresses, and they must equal
+ * LANTERN_GFX_PHYS/LANTERN_IOSFC_PHYS in gatehouse/dt/build_adt.py.  The
+ * authentic VMApple machine uses physical 0x30200000/0x30210000; on QEMU virt
+ * those fall inside the PCIe MMIO32 window, so the windows live in the unused
+ * peripheral window instead.  The addresses belong in the machine
+ * description, not in the front-end. */
+#define GH_LANTERN_GFX_BASE     0x0b000000ull
+#define GH_LANTERN_IOSFC_BASE   0x0b010000ull
+#define GH_LANTERN_WINDOW_SIZE  0x00010000ull
+
+/* lantern.c */
+u64  gh_lantern_mmio_read(u64 ipa, u32 size);
+void gh_lantern_mmio_write(u64 ipa, u32 size, u64 value);
 
 /* macho.c */
 #define GH_MAX_SEGS 32

@@ -12,8 +12,13 @@ LD       := lld-link
 OBJCOPY  := llvm-objcopy
 
 TARGETFLAGS := --target=aarch64-unknown-windows
+# -mstrict-align: the code that runs after the handoff (gh_jump_to_kernel,
+# gh_stage2_init and the EL2 trap handler) executes with the EL2 MMU and
+# caches off, so every access is Device-nGnRnE and an unaligned access is an
+# alignment fault.  Without this, the optimiser happily merges three adjacent
+# u64 stores into one 16-byte store at an 8-byte offset.
 CFLAGS  := $(TARGETFLAGS) -ffreestanding -fno-stack-protector -fno-builtin \
-           -fshort-wchar -mno-red-zone -O2 -g -Wall -Wextra \
+           -fshort-wchar -mno-red-zone -mstrict-align -O2 -g -Wall -Wextra \
            -Wno-unused-parameter -Iinclude -ffunction-sections -fdata-sections \
            -march=armv8-a+pauth
 
@@ -22,7 +27,7 @@ CFLAGS += -DGH_ATTACH_STALL_MS=$(STALL)
 endif
 
 SRCS := src/main.c src/lib.c src/uart.c src/macho.c src/bootargs.c src/fixups.c \
-        src/patch.c src/adt.c
+        src/patch.c src/adt.c src/stage2.c src/lantern.c
 OBJS := $(SRCS:.c=.o) src/jump.o src/el2.o
 HDRS := $(wildcard include/*.h)
 

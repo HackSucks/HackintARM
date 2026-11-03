@@ -74,6 +74,38 @@ With both changes, XNU runs at EL1 under Trestle and boots the full disk to
 `Early boot complete`, then to a `loginwindow` crash-loop -- the same frontier
 as the EL1 boot, which is display/GPU work (see [`lantern.md`](lantern.md)).
 
+### Stage 2
+
+`gh_stage2_init` installs Trestle's stage-2 map just before the `eret`. It is an
+identity map for bringing up, with two deliberate holes: Lantern's GPU and
+IOSurface windows (see [`lantern.md`](lantern.md)). An access to either window
+therefore traps to EL2, where `gh_el2_trap_c` decodes the syndrome, emulates the
+access against the front-end, and resumes the guest at `ELR_EL2 + 4`.
+
+The map is 4 KiB, `T0SZ=25` (39-bit IPA), `SL0=1` (start at level 1, 1 GiB
+blocks), `PS=2` (40-bit physical). RAM is three 1 GiB Normal blocks; the
+sub-1 GiB device region is 2 MiB Device blocks, except the 2 MiB block holding
+the two windows, which gets a 4 KiB table so only the windows are absent.
+`VTCR_EL2_RES1` is bit 31 only. Two things cost real time here:
+
+* **Stage 2 does not use `MAIR_EL2`.** The memory attributes live in the
+  descriptor's `MemAttr[3:0]` field (bits `[5:2]`), and the encoding is not
+  MAIR's: `0b0000` is Device-nGnRnE and `0b1111` is Normal write-back. To a
+  first approximation, everything that looks like "index 1" here is Device.
+* **`HPFAR_EL2.FIPA` is bits `[47:4]` and holds IPA bits `[47:12]`.** The IPA is
+  therefore `((hpfar & 0xfffffffff0) << 8) | (far & 0xfff)`, not the raw
+  register. `FAR_EL2` contributes the 4 KiB offset.
+
+There is also a code-generation trap: between `SCTLR_EL2.M = 0` and the
+`eret`, EL2 accesses are Device-nGnRnE, so an unaligned access is an alignment
+fault. The optimiser will happily merge adjacent `u64` stores into a 16-byte
+store at an 8-byte offset; Gatehouse is built with `-mstrict-align` for that
+reason (`DFSC=0x21`, `FAR` in `.data`, `ELR` inside `gh_stage2_init`).
+
+Stage 2 is inert for the default ADT, which does not publish the Lantern nodes,
+so the baseline boot is unchanged. With `LANTERN=1`, the nodes appear and XNU's
+`AppleParavirtGPU` matches, probes, and drives the trapped register file.
+
 ## Licence
 
 GPL-2.0-or-later for everything HackintARM authors; third-party Acidanthera

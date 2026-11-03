@@ -139,6 +139,26 @@ GICR_SIZE = 0x20000
 PL031_PHYS = 0x09010000            # PL031 RTC
 PL031_SIZE = 0x1000
 
+# Lantern's two windows.  Stage 2 (gatehouse/src/stage2.c) traps exactly these
+# addresses, so this table and the page-table holes have to agree.
+#
+# The addresses the authentic AVP publishes are physical 0x30200000 (gfx) and
+# 0x30210000 (iosurface-mapper): its ADT's reg fields are SoC-relative
+# (0x20200000 and 0x20210000 from a 0x10000000 SoC base), and that is what
+# QEMU's vmapple machine maps (hw/arm/vmapple.c memmap[]).  On QEMU virt those
+# physical addresses sit inside the PCIe MMIO32 window (0x10000000..
+# 0x3EFF0000), where UEFI places BARs, so the bring-up machine puts the same
+# two 64 KiB windows in the unused part of virt's peripheral window instead.
+# Only the machine description changes; the ADT contract and the guest driver
+# do not.
+LANTERN_GFX_PHYS = 0x0B000000
+LANTERN_IOSFC_PHYS = 0x0B010000
+LANTERN_WINDOW_SIZE = 0x00010000
+# GIC ids, not SPI numbers: the authentic node carries 0x31 (SPI 17) and 0x30
+# (SPI 16), which is the raw id XNU's "interrupts" cells use.
+LANTERN_IRQ_GFX = 0x31
+LANTERN_IRQ_IOSFC = 0x30
+
 # QEMU virt's PCIe host bridge (hw/pci-host/gpex.c + hw/arm/virt.c).  This one
 # *is* backed, and it is how the root disk attaches: XNU's storage stack is
 # AppleVirtIOStorageDevice behind AppleVirtIOTransport, whose PCI transport
@@ -246,6 +266,9 @@ PHANDLE_PCIE = 0x3F
 # Kept for the numbering, but not published by this machine: see the note above
 # /arm-io in build().  Trestle's AVP machine does carry the node.
 PHANDLE_PL061_BUTTONS = 0x40
+# Lantern's paravirtual graphics device: the authentic AVP tree's phandles.
+PHANDLE_IOSFC = 0x41
+PHANDLE_GFX = 0x42
 PHANDLE_PRAM = 0x44
 PHANDLE_VRAM = 0x45
 PHANDLE_DEFAULTS = 0x46
@@ -574,7 +597,7 @@ def nvram_proxy_data(size=NVRAM_SIZE):
 # between Gatehouse and XNU, and the only thing that has to change to move to a
 # different machine.
 # ---------------------------------------------------------------------------
-def build():
+def build(lantern=False):
     # ---------------------------------------------------------------------
     # /arm-io: the SoC's device window.
     # ---------------------------------------------------------------------
@@ -690,6 +713,43 @@ def build():
         ("device-interrupt-parent", u32(PHANDLE_GIC)),
     )
 
+    # ---------------------------------------------------------------------
+    # /arm-io/gfx and /arm-io/iosurface-mapper: Lantern.
+    #
+    # These are the authentic VMApple nodes (checked node for node against
+    # kernel/DeviceTree.vma2macosap.adt), with this machine's window
+    # addresses.  They are opt-in: publishing them makes AppleParavirtGPU and
+    # AppleParavirtIOSurface match and probe, which is only useful once the
+    # stage-2 trap handler can answer them.  With `make`'s default tree they
+    # are absent and the rest of the boot is byte-for-byte unchanged.
+    #
+    # The driver matches `compatible`, reads `role`, maps `reg` (through
+    # /arm-io's ranges) and registers `interrupts` against `interrupt-parent`.
+    # `gpu-sysmem-reserve-percent` is a syscfg reference, not a number.
+    # ---------------------------------------------------------------------
+    lantern_nodes = []
+    if lantern:
+        iosfc = node(
+            "iosurface-mapper",
+            ("compatible", s("paravirtualizedgraphics,iosurface")),
+            ("role", s("APV_IOSFC")),
+            ("reg", u64(LANTERN_IOSFC_PHYS - SOC_BASE, LANTERN_WINDOW_SIZE)),
+            ("interrupt-parent", u32(PHANDLE_GIC)),
+            ("interrupts", u32(LANTERN_IRQ_IOSFC)),
+            ("AAPL,phandle", u32(PHANDLE_IOSFC)),
+        )
+        gfx = node(
+            "gfx",
+            ("compatible", s("paravirtualizedgraphics,gpu")),
+            ("role", s("APV_GFX")),
+            ("reg", u64(LANTERN_GFX_PHYS - SOC_BASE, LANTERN_WINDOW_SIZE)),
+            ("interrupt-parent", u32(PHANDLE_GIC)),
+            ("interrupts", u32(LANTERN_IRQ_GFX)),
+            ("gpu-sysmem-reserve-percent", s("syscfg/gsrp")),
+            ("AAPL,phandle", u32(PHANDLE_GFX)),
+        )
+        lantern_nodes = [iosfc, gfx]
+
     arm_io = node(
         "arm-io",
         ("compatible", s("arm-io,vmapple1")),
@@ -706,7 +766,7 @@ def build():
         # third cell (the window size) is what iBoot publishes; 0 for the base
         # means "no SoC" and disables the serial console entirely.
         ("ranges", u64(0, SOC_BASE, SOC_SIZE)),
-        children=[gic, uart, pl031_rtc, pcie],
+        children=[gic, uart, pl031_rtc, pcie] + lantern_nodes,
     )
 
     # ---------------------------------------------------------------------
@@ -1136,9 +1196,12 @@ def build():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-o", "--output", default=None)
+    ap.add_argument("--lantern", action="store_true",
+                    default=bool(os.environ.get("LANTERN")),
+                    help="publish the gfx/iosurface-mapper nodes (Lantern)")
     args = ap.parse_args()
 
-    root = build()
+    root = build(lantern=args.lantern)
     blob = emit(root)
 
     out = args.output

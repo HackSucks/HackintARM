@@ -143,6 +143,7 @@ void gh_el2_unexpected_c(u64 esr, u64 far, u64 elr, u64 spsr, u64 cel, u64 hcr)
  */
 #define ESR_EC_HVC64	0x16u
 #define ESR_EC_SMC64	0x17u
+#define ESR_EC_DABT_LOW	0x24u
 
 #define GH_PSCI_ID_MASK	0xbfffffffu
 
@@ -183,7 +184,7 @@ static i64 gh_psci(u32 function, u64 arg0)
 }
 
 __attribute__((used))
-u64 gh_el2_trap_c(u64 esr, u64 elr, u64 *regs)
+u64 gh_el2_trap_c(u64 esr, u64 far, u64 hpfar, u64 elr, u64 *regs)
 {
 	u32 ec = (u32)(esr >> 26) & 0x3fu;
 
@@ -198,6 +199,65 @@ u64 gh_el2_trap_c(u64 esr, u64 elr, u64 *regs)
 
 		regs[0] = (u64)ret;
 		return elr;
+	}
+
+	if (ec == ESR_EC_DABT_LOW) {
+		u32 iss = (u32)(esr & 0x1ffffffu);
+		/*
+		 * HPFAR_EL2.FIPA holds the faulting IPA's page in bits
+		 * [47:4] (bits [47:12] of the IPA), not at the IPA's own
+		 * bit positions, and FAR_EL2 supplies the 4 KiB offset.
+		 * With the 40-bit IPA this image uses, FIPA[35:4] is
+		 * IPA[39:12].
+		 */
+		u64 ipa = ((hpfar & 0xfffffffff0ull) << 8) | (far & 0xfffull);
+		u32 sas = (iss >> 22) & 3u;
+		u32 srt = (iss >> 16) & 0x1fu;
+		u64 size = 1ull << sas;
+		u64 mask = (size == 8) ? ~0ull : ((1ull << (size * 8)) - 1);
+		int is_write = (int)((iss >> 6) & 1u);
+
+		/*
+		 * Only a stage-2 fault with a valid syndrome is emulated, and
+		 * only for Lantern's windows.  Anything else is a bug in the
+		 * map, not a device access: report it rather than returning
+		 * a plausible-looking zero.
+		 */
+		if ((iss & (1u << 24)) &&
+		    ipa >= GH_LANTERN_GFX_BASE &&
+		    ipa < GH_LANTERN_IOSFC_BASE + GH_LANTERN_WINDOW_SIZE) {
+			if (is_write) {
+				u64 value = (srt == 31) ? 0 : regs[srt];
+
+				gh_lantern_mmio_write(ipa, (u32)size,
+						      value & mask);
+			} else {
+				u64 value = gh_lantern_mmio_read(ipa,
+								 (u32)size) &
+					     mask;
+
+				if (!(iss & (1u << 15)))	/* SF */
+					value &= 0xffffffffull;
+				if (iss & (1u << 21)) {		/* SSE */
+					u32 sh = 64 - (u32)(size * 8);
+
+					value = (u64)((i64)(value << sh) >> sh);
+				}
+				if (srt != 31)
+					regs[srt] = value;
+			}
+			return elr + 4;
+		}
+
+		gh_uart_puts("\nEL2 data abort\n");
+		gh_loghex("esr_el2         : ", esr);
+		gh_loghex("far_el2         : ", far);
+		gh_loghex("hpfar_el2       : ", hpfar);
+		gh_loghex("ipa             : ", ipa);
+		gh_loghex("elr_el2         : ", elr);
+		for (;;) {
+			__asm__ volatile("wfi");
+		}
 	}
 
 	gh_uart_puts("\nEL2 unhandled synchronous trap\n");
