@@ -38,6 +38,42 @@ legitimate Apple IPSW (`tools/ipsw_extract.py`, `tools/im4p_extract.py`). The
 restore image we use, its build identity, and the member map are in
 [`docs/ipsw.md`](ipsw.md).
 
+## Running with EL2 (Trestle)
+
+Trestle needs EL2. Pass `VIRT_EXTRA=virtualization=on`:
+
+```sh
+VIRT_EXTRA=virtualization=on ./qemu/run.sh
+```
+
+With the virtualization extensions enabled, firmware is entered at EL2 and runs
+in VHE host mode, servicing its own interrupts there. Pulling UEFI down to EL1
+mid-boot fights that live exception state, so Gatehouse does not: it runs at the
+firmware's EL and only touches EL2 in `gh_jump_to_kernel`, at the final handoff,
+when Boot Services are gone. It disables the firmware's `SCTLR_EL2` (VHE), sets
+`HCR_EL2`, installs Trestle's vectors and stack, and `eret`s to XNU at EL1h.
+The same path works on hardware; only the way the loader obtains EL2 differs.
+
+Two things learned the hard way and worth keeping in mind:
+
+* **Pointer authentication must be enabled for EL1.** When EL2 is enabled and
+  `HCR_EL2.API` is 0, every PAC instruction at EL1 is architecturally
+  UNDEFINED. XNU's first `pacibsp` then lands in Trestle's vector table as
+  EC `0x09`. `HCR_EL2` therefore carries `{APK,API}` in addition to `RW`.
+* **The vector layout depends on `HCR_EL2.E2H`.** Trestle runs with `E2H=0`,
+  so lower-EL AArch64 traps arrive at `VBAR_EL2 + 0x400`, not `+0x200` (the
+  latter is the current-EL/SPx group). Getting this wrong sends every HVC to
+  the dead-end handler.
+
+The emulated CPU is also matched to the target SoC: `max,sve=off,sme=off`. An
+Apple T8103 has neither SVE nor SME; with QEMU's defaults XNU probes the SME
+control registers (`SMCR_EL1`/`SMPRI_EL1`), which trap to EL2 and would tempt
+it into code paths the real machine cannot execute.
+
+With both changes, XNU runs at EL1 under Trestle and boots the full disk to
+`Early boot complete`, then to a `loginwindow` crash-loop -- the same frontier
+as the EL1 boot, which is display/GPU work (see [`lantern.md`](lantern.md)).
+
 ## Licence
 
 GPL-2.0-or-later for everything HackintARM authors; third-party Acidanthera

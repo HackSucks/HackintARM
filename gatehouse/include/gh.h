@@ -33,6 +33,14 @@ int   gh_memcmp(const void *a, const void *b, u64 n);
 u64   gh_strlen(const char *s);
 void  gh_log(const char *s);
 void  gh_loghex(const char *tag, u64 v);
+u64   gh_current_el(void);
+
+/* EL2 shell (src/el2.S): reports an unexpected trap to EL2. */
+void gh_el2_unexpected_c(u64 esr, u64 far, u64 elr, u64 spsr, u64 cel, u64 hcr);
+
+/* Lower-EL synchronous trap: returns the address to resume the guest at.
+ * regs[0..18] are the guest's x0..x18 (regs[0] becomes its x0 on return). */
+u64 gh_el2_trap_c(u64 esr, u64 elr, u64 *regs);
 
 /* macho.c */
 #define GH_MAX_SEGS 32

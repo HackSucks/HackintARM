@@ -378,76 +378,79 @@ open question (see §10).
 ## 6. Integration A: QEMU `virt`
 
 The first target is the existing QEMU `virt` bring-up, because that is where the
-guest already reaches userland.
+guest already reaches userland. QEMU is only the CPU, RAM, GIC and timer now:
+the machine is started with `-M virt,virtualization=on`, which enters the
+firmware (and therefore Gatehouse) at EL2. Trestle installs its own EL2 state
+there, `eret`s to XNU at EL1, and owns every Lantern-facing device from inside
+the guest. **No GPU or IOSurface device is added to QEMU**; adding one would
+create a second device model that has no hardware equivalent and would not
+carry over to the real machine.
 
-### Device and addresses
+### Where each layer runs
 
-A `SysBusDevice` modelled on reims-vgpu's `apple-gfx-mmio`:
+- **Trestle at EL2** owns the two windows, the ADT nodes, the stage-2 mappings
+  that trap them, MMIO dispatch, and interrupt injection through the GICv3
+  virtual interface (`ICH_*` list registers). This is the same code that will
+  run on hardware.
+- **The reims-vgpu core and its Vulkan backend** need an OS (Vulkan, files,
+  windowing), which EL2 does not have. On the hosted bring-up they run in a
+  host process.
+- **The only QEMU-side addition is a transport**: shared guest RAM
+  (`memory-backend-file,share=on`) plus a doorbell. It moves bytes and signals
+  and knows nothing about PVG; it is to Lantern what a shared-memory ring
+  between two hardware domains is.
+- **On hardware** the same backend moves into a privileged host domain
+  (EL1/EL0) or a freestanding GPU driver, behind the identical ring. Only the
+  transport changes.
 
-- two MMIO regions (GPU and IOSurface, 64 KiB each);
-- two IRQ outputs;
-- properties for the RAM memory region and the display geometry;
-- `rvg_device_create` at realize, release at unrealize.
+### Device windows
 
-Proposed machine description for QEMU `virt` (offsets are from the machine's
-`soc_base`, `0x08000000`):
+Use the authentic AVP addresses rather than inventing new ones:
 
-| Device | Offset | Physical | Size | GIC id |
-|---|---|---|---|---|
-| `lantern-gfx` | `0x03000000` | `0x0b000000` | 64 KiB | SPI 0x30 (48) |
-| `lantern-iosfc` | `0x03010000` | `0x0b010000` | 64 KiB | SPI 0x31 (49) |
+| Device | Physical | Size | GIC id |
+|---|---|---|---|
+| `gfx` (`paravirtualizedgraphics,gpu`) | `0x20200000` | 64 KiB | SPI 0x31 (49) |
+| `iosurface-mapper` (`paravirtualizedgraphics,iosurface`) | `0x20210000` | 64 KiB | SPI 0x30 (48) |
 
-These addresses are inside `virt`'s `VIRT_MMIO` window and clear of the
-virtio-mmio slots, the PL011, RTC, GPIO and ACPI regions. They must be identical
-in:
+They must be identical in three places, from one definition:
 
-- `gatehouse/dt/build_adt.py` (the ADT nodes), and
-- `trestle/src/machines.c` (`g_qemu_windows`), and
-- the QEMU device's placement.
+- `gatehouse/dt/build_adt.py` (the ADT nodes);
+- `trestle/src/machines.c` (the machine windows);
+- the stage-2 trap configuration Trestle installs before `eret` to XNU.
 
-If the AVP's real offsets are used instead, the same rule applies: one machine
-description, three consumers. The authentic AVP values are `0x20200000`
-(GPU) and `0x20210000` (IOSurface), with GIC ids 49 and 48; QEMU `virt` can
-publish them at those physical addresses too, as long as nothing else claims
-them.
+Nothing else in QEMU `virt` claims these addresses.
 
 ### Guest RAM
 
-QEMU must give the device file-backed RAM. The launcher will switch to
-`memory-backend-file,share=on` (one backend for the low RAM region) and pass the
-backend's file descriptor to the device. Without that, Vulkan cannot create host
-views, and the first texture upload fails.
+Stage 2 *is* the guest-memory map. It starts as an identity map so XNU sees the
+same RAM layout it sees today, and grows per-page hooks only where the PVG
+protocol needs the host to pin or translate a page. The host process maps the
+same RAM through `memory-backend-file,share=on`, so a page the guest writes is
+the same bytes reims-vgpu reads -- no copying and no second interpretation of
+the guest's page tables.
 
 ### Display
 
-Two modes, in order of usefulness:
-
-1. **Library window** — `RvgWindowConfig` with `RVG_WINDOW_MATCH_HOST_SCREEN`.
-   Fastest route to a visible desktop; also gives input for free. On a headless
-   host, use SDL's offscreen driver or leave it off.
-2. **QEMU display sink** — encode into a frame target and copy into QEMU's
-   `DisplaySurface`, so `-display gtk` and QMP `screendump` work without the
-   library's window. This is the mode that matches the eventual scanout path.
-
-QMP `screendump` is the acceptance check: a frame with the Dock and menu bar is
-a real desktop, not merely a process that has not crashed yet.
+The first sink is reims-vgpu's own window (`RvgWindowConfig`,
+`RVG_WINDOW_MATCH_HOST_SCREEN`), which also gives input for free. Frame-target
+readback (`rvg_frame_target_read_pixels`) is the headless check: it must show
+the login window and menu bar, not merely a process that has not crashed. A
+QEMU display sink is deliberately *not* part of the bring-up -- QEMU has no GPU
+device to draw into; the scanout buffer belongs to the backend, and on hardware
+it goes straight to the display controller.
 
 ### Build
 
-QEMU's device needs to be compiled into the emulator. Lantern will carry a
-small patch series against a pinned QEMU, applied by `lantern/qemu/build.sh`;
-the device code itself lives in `lantern/qemu/hw/display/` and links
-`libreims_vgpu.a`. The alternative — an out-of-tree module — still needs QEMU's
-headers and a matching build, so a pinned patch series is simpler and
-reproducible.
+- `libreims_vgpu.a` plus a small host launcher, built for the host
+  (x86-64 or AArch64 Linux);
+- Trestle's EL2 front-end built into the Gatehouse boot image;
+- no QEMU patch series and no out-of-tree QEMU module.
 
 ### What stays QEMU-specific
 
-Only this directory: the SysBus wrapper, the IRQ wiring, the RAM backend, the
-display sink and `run.sh` arguments. The front-end core and the ADT contract are
-shared with Trestle.
-
----
+Only the transport instantiation in `qemu/run.sh` and the host launcher. The ADT
+contract, the front-end, the PVG protocol and the Platform backend are shared
+with the hardware path.
 
 ## 7. Integration B: Trestle and bare metal
 
@@ -458,16 +461,18 @@ description that supplies windows and interrupt ids.
 The Lantern Trestle model:
 
 - `init` finds the `lantern-gfx` and `lantern-iosfc` windows in the machine
-  description, creates the reims-vgpu devices, and records the guest RAM map.
+  description, records the guest RAM map, and brings up the transport to the
+  backend.
 - `adt_contribute` publishes the GPU and IOSurface nodes (the same contract as
-  the QEMU path).
-- `mmio_read` / `mmio_write` forward to the core.
-- `deinit` releases the devices.
+  every other path).
+- `mmio_read` / `mmio_write` forward to the PVG core.
+- `deinit` tears the transport down.
 - The trap layer routes stage-2 faults for the two windows to the model, and
-  interrupt injection uses the machine's GIC.
+  interrupt injection uses the machine's GICv3 virtual interface.
 
 The display sink on bare metal is a framebuffer or scanout buffer owned by the
-native GPU backend, not a window.
+native GPU backend, not a window. The front-end is shared with the hosted
+bring-up; only the backend and the transport under it are replaced.
 
 ### The freestanding problem
 
@@ -505,9 +510,10 @@ seen in a boot log or a screenshot.
 
 ### Phase 0 — Probe
 
-- Add the ADT nodes and the QEMU/Trestle device windows.
-- Create the reims-vgpu device and IOSurface device with a memory map.
-- Boot the existing image.
+- Add the ADT nodes and the Trestle device windows (stage-2 trap ranges).
+- Open the transport and create the reims-vgpu device and IOSurface device
+  with a memory map on the backend side.
+- Boot the existing image with `virt,virtualization=on`.
 
 **Done when:** the guest logs `AppleParavirtGPU` and `AppleParavirtIOSurface`
 matching and starting, and the first MMIO reads (binary version, base) appear in
@@ -559,9 +565,9 @@ and menu bar, and `WindowServer` survives for minutes.
 
 ### Phase 6 — Bare metal
 
-- Port the front-end to Trestle's trap layer.
-- Replace the machine description and the Platform backend.
-- Keep the ADT contract and guest driver untouched.
+- Replace the hosted transport with the hardware one and the Platform backend
+  with the native GPU driver.
+- Keep the front-end, the ADT contract and the guest driver untouched.
 
 **Done when:** the same kernel collection reaches the same desktop on a physical
 AArch64 machine.

@@ -105,6 +105,7 @@ static void banner(void)
 	gh_loghex("system table    : ", (u64)ST);
 	gh_loghex("boot services   : ", (u64)BS);
 	gh_loghex("firmware rev    : ", (u64)ST->FirmwareRevision);
+	gh_loghex("exception level : ", gh_current_el());
 }
 
 static void dump_config_tables(void)

@@ -23,7 +23,7 @@ endif
 
 SRCS := src/main.c src/lib.c src/uart.c src/macho.c src/bootargs.c src/fixups.c \
         src/patch.c src/adt.c
-OBJS := $(SRCS:.c=.o) src/jump.o
+OBJS := $(SRCS:.c=.o) src/jump.o src/el2.o
 HDRS := $(wildcard include/*.h)
 
 LDFLAGS := /machine:arm64 /subsystem:efi_application /entry:efi_main \
@@ -41,6 +41,9 @@ $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 src/jump.o: src/jump.S
+	$(CC) $(TARGETFLAGS) -c $< -o $@
+
+src/el2.o: src/el2.S
 	$(CC) $(TARGETFLAGS) -c $< -o $@
 
 clean:

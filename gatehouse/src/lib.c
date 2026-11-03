@@ -96,6 +96,119 @@ void gh_loghex(const char *tag, u64 v)
 	gh_uart_putc('\n');
 }
 
+/* The exception level this code is running at (0-3).  Gatehouse runs at the
+ * EL the firmware hands it: EL1 without the virtualization extensions, EL2
+ * with them (QEMU `virt,virtualization=on`, and on hardware with EL2).  The
+ * distinction decides whether the final handoff has to install Trestle's
+ * EL2 state before eret-ing to XNU at EL1. */
+u64 gh_current_el(void)
+{
+	u64 v;
+	__asm__ volatile("mrs %0, CurrentEL" : "=r"(v));
+	return (v >> 2) & 3;
+}
+
+__attribute__((used))
+void gh_el2_unexpected_c(u64 esr, u64 far, u64 elr, u64 spsr, u64 cel, u64 hcr)
+{
+	gh_uart_puts("\nEL2 unexpected exception\n");
+	gh_loghex("esr_el2         : ", esr);
+	gh_loghex("far_el2         : ", far);
+	gh_loghex("elr_el2         : ", elr);
+	gh_loghex("spsr_el2        : ", spsr);
+	gh_loghex("CurrentEL       : ", cel);
+	gh_loghex("hcr_el2         : ", hcr);
+	for (;;) {
+		__asm__ volatile("wfi");
+	}
+}
+
+/*
+ * The first service behind Trestle's EL2 trap layer: HVC/SMC from XNU.
+ *
+ * With EL2 present, every HVC and SMC executed at EL1 traps to Trestle.  Two
+ * callers exist on this platform:
+ *
+ *   - PSCI (0x8400_00xx / 0xc400_00xx), which QEMU used to answer itself;
+ *   - Apple's AVP platform calls (0xc100_00xx).  Gatehouse has already
+ *     neutralised the "branch to self unless x0 == 0" wedge after each site,
+ *     so NOT_SUPPORTED is the same answer QEMU gave and is safe here.
+ *
+ * The PSCI subset is the one Trestle's power manager will own once the
+ * platform library is linked into the boot image; keeping it here for now
+ * means the EL1 handoff can be validated without that larger change.
+ *
+ * Note: for HVC/SMC the architectural preferred return address is already the
+ * instruction *after* the trap, so ELR_EL2 is returned unchanged.
+ */
+#define ESR_EC_HVC64	0x16u
+#define ESR_EC_SMC64	0x17u
+
+#define GH_PSCI_ID_MASK	0xbfffffffu
+
+static i64 gh_psci(u32 function, u64 arg0)
+{
+	u32 fn = function & GH_PSCI_ID_MASK;
+
+	switch (fn) {
+	case 0x84000000u:			/* PSCI_VERSION */
+		return ((i64)1 << 16) | 1;	/* 1.1 */
+	case 0x8400000au:			/* PSCI_FEATURES */
+		switch ((u32)arg0 & GH_PSCI_ID_MASK) {
+		case 0x84000000u:		/* VERSION */
+		case 0x8400000au:		/* FEATURES */
+		case 0x84000004u:		/* AFFINITY_INFO */
+		case 0x84000001u:		/* CPU_SUSPEND */
+		case 0x84000002u:		/* CPU_OFF */
+		case 0x84000003u:		/* CPU_ON */
+		case 0x84000008u:		/* SYSTEM_OFF */
+		case 0x84000009u:		/* SYSTEM_RESET */
+			return 0;
+		default:
+			return -1;
+		}
+	case 0x84000004u:			/* AFFINITY_INFO */
+		return arg0 == 0 ? 0 : -2;	/* ON, or INVALID_PARAMS */
+	case 0x84000003u:			/* CPU_ON */
+		return arg0 == 0 ? -4 : -2;	/* ALREADY_ON, or INVALID */
+	case 0x84000002u:			/* CPU_OFF */
+	case 0x84000001u:			/* CPU_SUSPEND */
+	case 0x84000005u:			/* MIGRATE */
+	case 0x84000008u:			/* SYSTEM_OFF */
+	case 0x84000009u:			/* SYSTEM_RESET */
+		return 0;
+	default:
+		return -1;			/* NOT_SUPPORTED */
+	}
+}
+
+__attribute__((used))
+u64 gh_el2_trap_c(u64 esr, u64 elr, u64 *regs)
+{
+	u32 ec = (u32)(esr >> 26) & 0x3fu;
+
+	if (ec == ESR_EC_HVC64 || ec == ESR_EC_SMC64) {
+		u64 fn = regs[0];
+		i64 ret;
+
+		if ((fn >> 24) == 0x84u || (fn >> 24) == 0xc4u)
+			ret = gh_psci((u32)fn, regs[1]);
+		else
+			ret = -1;		/* Apple 0xc100_00xx */
+
+		regs[0] = (u64)ret;
+		return elr;
+	}
+
+	gh_uart_puts("\nEL2 unhandled synchronous trap\n");
+	gh_loghex("esr_el2         : ", esr);
+	gh_loghex("elr_el2         : ", elr);
+	gh_loghex("x0              : ", regs[0]);
+	for (;;) {
+		__asm__ volatile("wfi");
+	}
+}
+
 /* clang for the aarch64-windows target may emit this for big frames. */
 void __chkstk(void) { }
 void _chkstk(void) { }

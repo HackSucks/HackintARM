@@ -24,7 +24,14 @@ GH="$ROOT/gatehouse"
 KERNEL="${KERNEL:-$ROOT/kernel/kernelcache.release.vma2.kc}"
 ESP="$ROOT/build/esp"
 MEM="${MEM:-3G}"
-CPU="${CPU:-max}"
+# The machine being described is an Apple T8103 (M1) class SoC: it has
+# pointer authentication, but no SVE and no SME.  QEMU's `max` advertises
+# both, which makes XNU probe the SME control registers (SMCR_EL1/SMPRI_EL1)
+# and take an EL2 trap for hardware the real target does not have -- and, if
+# it were enabled instead, tempt XNU into streaming-mode code paths that
+# cannot work on the target.  Match the target here rather than teaching the
+# guest about features it will never see.
+CPU="${CPU:-max,sve=off,sme=off}"
 GDB_PORT="${GDB_PORT:-1234}"
 # The GDB stub is opt-in.  Runs launched with it (GDB=1) have repeatedly been
 # observed to park the vCPU thread under TCG -- guest PC somewhere in early
@@ -168,7 +175,7 @@ QARGS=(
   # highmem=off leaves 3G at 0x40000000..0x100000000, and MEM + the
   # dram-base/dram-size in gatehouse/dt/build_adt.py (and trestle's QEMU
   # machine description) have to agree on that.
-  -M virt,gic-version=3,highmem-ecam=off,highmem=off
+  -M "virt,gic-version=3,highmem-ecam=off,highmem=off${VIRT_EXTRA:+,$VIRT_EXTRA}"
   -cpu "$CPU"
   -m "$MEM"
   -bios "$FW_CODE"
