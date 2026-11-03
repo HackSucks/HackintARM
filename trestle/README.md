@@ -39,6 +39,17 @@ make            # libtrestle.a (aarch64-none-elf)
 make test       # host-side model tests
 ```
 
+The same sources also build for the UEFI boot image. Gatehouse is a
+`aarch64-unknown-windows` PE/COFF application, not an ELF one, so Trestle is
+compiled with that target and linked in as a static library; the only thing
+that needed changing for it is that `u64`/`s64`/`usize` are fixed-width rather
+than `long`, which LLP64 and LP64 disagree about.
+
+```sh
+clang --target=aarch64-unknown-windows ... -c src/*.c
+llvm-ar rcs libtrestle-coff.a *.o
+```
+
 `make test` builds both machine descriptions' trees and checks the properties
 the boot path depends on. It can also write the bring-up tree out so
 `../tools/adt_diff.py` can compare it, node for node, with the one

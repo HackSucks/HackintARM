@@ -30,9 +30,12 @@ typedef unsigned short     u16;
 typedef signed short       s16;
 typedef unsigned int       u32;
 typedef signed int         s32;
-typedef unsigned long      u64;
-typedef signed long        s64;
-typedef unsigned long      usize;
+// Fixed-width on every ABI, not "whatever long is": the same objects are
+// built for aarch64 ELF (the bring-up library) and aarch64 COFF (linked
+// into the UEFI boot image), and those disagree on long.
+typedef unsigned long long u64;
+typedef signed long long   s64;
+typedef unsigned long long usize;
 
 #define TRESTLE_ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define TRESTLE_UNUSED(x)     ((void)(x))
