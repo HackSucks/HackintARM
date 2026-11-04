@@ -62,8 +62,10 @@ void gh_stage2_init(void);
 #define GH_LANTERN_WINDOW_SIZE  0x00010000ull
 
 /* lantern.c */
-u64  gh_lantern_mmio_read(u64 ipa, u32 size);
-void gh_lantern_mmio_write(u64 ipa, u32 size, u64 value);
+/* pc is the guest's ELR_EL2 for the trapped access, kept for the trace so a
+ * register access can be traced back to the kernel function that made it. */
+u64  gh_lantern_mmio_read(u64 ipa, u32 size, u64 pc);
+void gh_lantern_mmio_write(u64 ipa, u32 size, u64 value, u64 pc);
 
 /* macho.c */
 #define GH_MAX_SEGS 32

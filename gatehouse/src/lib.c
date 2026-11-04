@@ -230,10 +230,10 @@ u64 gh_el2_trap_c(u64 esr, u64 far, u64 hpfar, u64 elr, u64 *regs)
 				u64 value = (srt == 31) ? 0 : regs[srt];
 
 				gh_lantern_mmio_write(ipa, (u32)size,
-						      value & mask);
+						      value & mask, elr);
 			} else {
 				u64 value = gh_lantern_mmio_read(ipa,
-								 (u32)size) &
+								 (u32)size, elr) &
 					     mask;
 
 				if (!(iss & (1u << 15)))	/* SF */

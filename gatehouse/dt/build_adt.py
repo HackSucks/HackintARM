@@ -155,7 +155,10 @@ LANTERN_GFX_PHYS = 0x0B000000
 LANTERN_IOSFC_PHYS = 0x0B010000
 LANTERN_WINDOW_SIZE = 0x00010000
 # GIC ids, not SPI numbers: the authentic node carries 0x31 (SPI 17) and 0x30
-# (SPI 16), which is the raw id XNU's "interrupts" cells use.
+# (SPI 16), which is the raw id XNU's "interrupts" cells use.  The property is
+# two cells, <id 0>, because the GIC node says #interrupt-cells = 2: a single
+# cell holds no complete specifier, and a driver that registers its interrupt
+# in start() would give up before it ever touched a register.
 LANTERN_IRQ_GFX = 0x31
 LANTERN_IRQ_IOSFC = 0x30
 
@@ -597,7 +600,7 @@ def nvram_proxy_data(size=NVRAM_SIZE):
 # between Gatehouse and XNU, and the only thing that has to change to move to a
 # different machine.
 # ---------------------------------------------------------------------------
-def build(lantern=False):
+def build(lantern=False, gsrp="syscfg"):
     # ---------------------------------------------------------------------
     # /arm-io: the SoC's device window.
     # ---------------------------------------------------------------------
@@ -735,19 +738,29 @@ def build(lantern=False):
             ("role", s("APV_IOSFC")),
             ("reg", u64(LANTERN_IOSFC_PHYS - SOC_BASE, LANTERN_WINDOW_SIZE)),
             ("interrupt-parent", u32(PHANDLE_GIC)),
-            ("interrupts", u32(LANTERN_IRQ_IOSFC)),
+            ("interrupts", u32(LANTERN_IRQ_IOSFC, 0)),
             ("AAPL,phandle", u32(PHANDLE_IOSFC)),
         )
-        gfx = node(
-            "gfx",
+        # gpu-sysmem-reserve-percent is the one property iBoot rewrites: the
+        # authentic tree names a syscfg entry and iBoot resolves it.  Which
+        # form the driver tolerates is not established (docs/lantern.md,
+        # section 10), so it is selectable:
+        #   syscfg  the authentic unresolved string (default, unchanged)
+        #   omit    no property at all, so the driver falls back to its default
+        #   <n>     a resolved 32-bit percentage
+        gfx_props = [
             ("compatible", s("paravirtualizedgraphics,gpu")),
             ("role", s("APV_GFX")),
             ("reg", u64(LANTERN_GFX_PHYS - SOC_BASE, LANTERN_WINDOW_SIZE)),
             ("interrupt-parent", u32(PHANDLE_GIC)),
-            ("interrupts", u32(LANTERN_IRQ_GFX)),
-            ("gpu-sysmem-reserve-percent", s("syscfg/gsrp")),
-            ("AAPL,phandle", u32(PHANDLE_GFX)),
-        )
+            ("interrupts", u32(LANTERN_IRQ_GFX, 0)),
+        ]
+        if gsrp == "syscfg":
+            gfx_props.append(("gpu-sysmem-reserve-percent", s("syscfg/gsrp")))
+        elif gsrp != "omit":
+            gfx_props.append(("gpu-sysmem-reserve-percent", u32(int(gsrp, 0))))
+        gfx_props.append(("AAPL,phandle", u32(PHANDLE_GFX)))
+        gfx = node("gfx", *gfx_props)
         lantern_nodes = [iosfc, gfx]
 
     arm_io = node(
@@ -1197,11 +1210,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-o", "--output", default=None)
     ap.add_argument("--lantern", action="store_true",
-                    default=bool(os.environ.get("LANTERN")),
+                    default=os.environ.get("LANTERN", "0") not in ("", "0"),
                     help="publish the gfx/iosurface-mapper nodes (Lantern)")
+    ap.add_argument("--gsrp",
+                    default=os.environ.get("LANTERN_GSRP", "syscfg"),
+                    help="gpu-sysmem-reserve-percent: 'syscfg' (authentic "
+                         "unresolved string, default), 'omit', or a number")
     args = ap.parse_args()
 
-    root = build(lantern=args.lantern)
+    root = build(lantern=args.lantern, gsrp=args.gsrp)
     blob = emit(root)
 
     out = args.output

@@ -531,7 +531,9 @@ seen in a boot log or a screenshot.
 
 **Done when:** the guest logs `AppleParavirtGPU` and `AppleParavirtIOSurface`
 matching and starting, and the first MMIO reads (binary version, base) appear in
-the device trace. No fault, no panic.
+the device trace. No fault, no panic. The trace line format is
+`lantern: gfx   rd  off <off> <REG> size <n> val <v> pc <guest pc>`; resolve
+`pc` with `tools/kcsym.py` to name the kernel function that made the access.
 
 ### Phase 1 — Register file and interrupts
 
@@ -608,6 +610,21 @@ AArch64 machine.
 
 ## 10. Open questions
 
+0. **Boot 2 (2026-11-03) saw no MMIO at all; boot 3 does.** With `LANTERN=1`
+   the kexts loaded but not one trapped access reached the front-end. Two
+   defects found by reading the tree against that log: the nodes' `interrupts`
+   was one cell although the GIC declares `#interrupt-cells = 2` (the
+   authentic value is `<id 0>`), so the driver had no complete specifier to
+   register; and the level-3 stage-2 entries around the windows used the block
+   encoding, which is reserved at level 3. Both are fixed. Boot 3
+   (2026-11-04) then matched and started both drivers, and the trace names the
+   path exactly: `setupMMIO`, `setupVersion`, `setupRoot`, `setupFIFO`,
+   `configureDevice` and `writeFifo` on the GPU window, and
+   `IOSurfaceParavirtMapperDevice::start` on the IOSurface window
+   (`tools/kcsym.py`). The trace stops after the FIFO is enabled: the stub
+   neither consumes FIFO commands nor raises an interrupt, so there is still
+   no display and `loginwindow` keeps crash-looping. That is the command-ring
+   phase, not an ADT problem.
 1. **`gpu-sysmem-reserve-percent`.** The authentic tree names a `syscfg/gsrp`
    reference rather than a number. How iBoot resolves it, and what the driver
    does with the resolved value, still has to be pinned down. Every other ADT

@@ -26,6 +26,10 @@
 
 #define S2_DESC_VALID  0x1ull
 #define S2_DESC_TABLE  0x3ull
+/* A level-3 entry is a *page* descriptor, bits [1:0] = 0b11.  0b01 is a
+ * block descriptor, which is only legal at levels 1 and 2; at level 3 it is
+ * a reserved encoding and faults like an unmapped page. */
+#define S2_DESC_PAGE   0x3ull
 #define S2_AF          (1ull << 10)
 #define S2_SH_INNER    (3ull << 8)
 #define S2_AP_RW       (3ull << 6)
@@ -58,6 +62,11 @@ static u64 s2_block(u64 pa, u64 attr)
 	return pa | attr | S2_DESC_VALID;
 }
 
+static u64 s2_page(u64 pa, u64 attr)
+{
+	return pa | attr | S2_DESC_PAGE;
+}
+
 void gh_stage2_init(void)
 {
 	const u64 lantern_block = GH_LANTERN_GFX_BASE & ~(S2_BLOCK_2M - 1);
@@ -81,7 +90,7 @@ void gh_stage2_init(void)
 		    pa < GH_LANTERN_IOSFC_BASE + GH_LANTERN_WINDOW_SIZE)
 			s2_l3_lantern[i] = 0;
 		else
-			s2_l3_lantern[i] = s2_block(pa, dev);
+			s2_l3_lantern[i] = s2_page(pa, dev);
 	}
 	s2_l2_dev[(lantern_block >> 21) & 0x1ff] =
 	    (u64)s2_l3_lantern | S2_DESC_TABLE;

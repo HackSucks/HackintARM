@@ -100,7 +100,9 @@ fi
 echo "== building device tree =="
 LANTERN_ARG=""
 if [[ "${LANTERN:-0}" == "1" ]]; then
-  LANTERN_ARG="--lantern"
+  # LANTERN_GSRP selects the gpu-sysmem-reserve-percent form the gfx node
+  # carries: syscfg (authentic unresolved string, default), omit, or a number.
+  LANTERN_ARG="--lantern --gsrp ${LANTERN_GSRP:-syscfg}"
 fi
 python3 "$GH/dt/build_adt.py" -o "$ROOT/build/gatehouse.adt" $LANTERN_ARG
 
