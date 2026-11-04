@@ -44,6 +44,14 @@ void gh_el2_unexpected_c(u64 esr, u64 far, u64 elr, u64 spsr, u64 cel, u64 hcr);
  * aborts). */
 u64 gh_el2_trap_c(u64 esr, u64 far, u64 hpfar, u64 elr, u64 *regs);
 
+/* memory.c: the machine's usable RAM, discovered from the firmware memory
+ * map.  gh_memory_discover() must succeed before anything asks for a base or
+ * size; gatehouse never assumes an address or a capacity. */
+int gh_memory_discover(EFI_BOOT_SERVICES *bs);
+u64 gh_memory_base(void);
+u64 gh_memory_top(void);
+u64 gh_memory_size(void);
+
 /* stage2.c: the identity map, with Lantern's windows left out. */
 void gh_stage2_init(void);
 
@@ -60,6 +68,12 @@ void gh_stage2_init(void);
 #define GH_LANTERN_GFX_BASE     0x0b000000ull
 #define GH_LANTERN_IOSFC_BASE   0x0b010000ull
 #define GH_LANTERN_WINDOW_SIZE  0x00010000ull
+
+/* The two page sizes this loader distinguishes.  UEFI allocates and counts
+ * memory in 4 KiB pages; XNU and the device tree use its 16 KiB translation
+ * granule. */
+#define GH_EFI_PAGE             0x1000ull
+#define GH_PAGE                 0x4000ull
 
 /* The GIC distributor, for pending a guest interrupt from EL2.  QEMU virt's
  * GICD; the authentic VMApple machine places it at 0x10000000.  Machine
@@ -162,6 +176,16 @@ int gh_bootargs_build(void *dst, u64 virt_base, u64 phys_base, u64 mem_size,
  */
 int gh_adt_add_property(u8 *dt, u64 cap, const char *path, const char *name,
     const void *value, u32 len, u64 *size);
+
+/* Replace an existing property's value in place, or add it when absent.  The
+ * length must match the existing property: an in-place edit does not move the
+ * tree, so nothing that already points into it goes stale. */
+int gh_adt_set_property(u8 *dt, u64 cap, const char *path, const char *name,
+    const void *value, u32 len, u64 *size);
+
+/* Read a property's value and length.  The pointer is into `dt`. */
+int gh_adt_get_property(const u8 *dt, u64 size, const char *path,
+    const char *name, const u8 **value, u32 *len);
 
 /* jump.S */
 void gh_jump_to_kernel(u64 entry, u64 bootargs_pa, u64 stack_top,

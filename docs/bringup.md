@@ -74,6 +74,31 @@ With both changes, XNU runs at EL1 under Trestle and boots the full disk to
 `Early boot complete`, then to a `loginwindow` crash-loop -- the same frontier
 as the EL1 boot, which is display/GPU work (see [`lantern.md`](lantern.md)).
 
+### Machine memory
+
+Nothing in Gatehouse assumes a RAM base or capacity. Before it places the
+kernel, `gh_memory_discover` (`gatehouse/src/memory.c`) asks the firmware for
+its memory map, merges the usable descriptors into runs, and takes the largest
+run. That answer drives every consumer:
+
+* `boot_args->physBase`/`memSize` and the kernel window's placement: the image
+  lands in the middle of the run, adjusted so the mach header keeps the
+  link-time congruence XNU's bootstrap mapping requires, and walked outwards
+  until `AllocatePages` finds free firmware pages;
+* `/chosen/dram-base` and `dram-size`, which `arm_init` makes mandatory;
+* `/pram`'s `reg`, which must name the panic region relative to wherever the
+  image actually landed;
+* `/arm-io`'s `ranges` window, which ends where RAM begins;
+* the stage-2 map above.
+
+So `-m 8G` on QEMU, a 16 GiB laptop, or a board whose DRAM starts at
+`0x800000000` all describe themselves. The tree that `build_adt.py` emits is a
+template: on the bring-up machine the patched values happen to equal the
+template's, which is why the default tree is still byte-for-byte unchanged.
+The one contract the guest imposes is a single contiguous DRAM window (XNU
+takes one `dram-base`/`dram-size` pair); machines with discontiguous RAM are
+described by their largest run and the others are logged.
+
 ### Stage 2
 
 `gh_stage2_init` installs Trestle's stage-2 map just before the `eret`. It is an
@@ -83,9 +108,12 @@ therefore traps to EL2, where `gh_el2_trap_c` decodes the syndrome, emulates the
 access against the front-end, and resumes the guest at `ELR_EL2 + 4`.
 
 The map is 4 KiB, `T0SZ=25` (39-bit IPA), `SL0=1` (start at level 1, 1 GiB
-blocks), `PS=2` (40-bit physical). RAM is three 1 GiB Normal blocks; the
-sub-1 GiB device region is 2 MiB Device blocks, except the 2 MiB block holding
-the two windows, which gets a 4 KiB table so only the windows are absent.
+blocks), `PS=2` (40-bit physical). It is built from the RAM window that
+`gh_memory_discover` read out of the firmware memory map, not from a constant:
+every 1 GiB block is a Device block by default, whole RAM blocks are Normal,
+and the two RAM edges get 2 MiB tables with 4 KiB pages so no byte outside the
+window is ever reported as cacheable memory. The 2 MiB block holding the two
+Lantern windows always gets a 4 KiB table, so only the windows are absent.
 `VTCR_EL2_RES1` is bit 31 only. Two things cost real time here:
 
 * **Stage 2 does not use `MAIR_EL2`.** The memory attributes live in the

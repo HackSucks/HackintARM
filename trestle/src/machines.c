@@ -135,6 +135,9 @@ trestle_machine *trestle_machine_qemu_virt(void)
 
     machine_seed_once();
 
+    // Defaults for a tree built without a boot context (the model tests).
+    // Gatehouse replaces them with the firmware map's largest usable run via
+    // trestle_machine_set_memory() before trestle_main().
     m.ram_base = 0x40000000ull;
     m.ram_size = 0xC0000000ull;         // MEM=3G + highmem=off in qemu/run.sh
 
@@ -242,4 +245,19 @@ trestle_machine *trestle_machine_avp(void)
     m.identity = &g_identity;
     m.log_write = 0;
     return &m;
+}
+
+// The boot knows what memory the machine actually has; the description only
+// knows what the machine usually has.  Keep the two coherent: DRAM is what
+// boot_args says, and the /arm-io device window runs from the SoC base to the
+// start of RAM (the tree's ranges property), so a machine that puts RAM
+// somewhere else still resolves its device addresses.
+void trestle_machine_set_memory(trestle_machine *m, u64 base, u64 size)
+{
+    if (m == 0 || size == 0)
+        return;
+    m->ram_base = base;
+    m->ram_size = size;
+    if (base > m->soc_base)
+        m->soc_size = base - m->soc_base;
 }

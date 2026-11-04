@@ -27,7 +27,7 @@ CFLAGS += -DGH_ATTACH_STALL_MS=$(STALL)
 endif
 
 SRCS := src/main.c src/lib.c src/uart.c src/macho.c src/bootargs.c src/fixups.c \
-        src/patch.c src/adt.c src/stage2.c src/lantern.c
+        src/patch.c src/adt.c src/memory.c src/stage2.c src/lantern.c
 OBJS := $(SRCS:.c=.o) src/jump.o src/el2.o
 HDRS := $(wildcard include/*.h)
 

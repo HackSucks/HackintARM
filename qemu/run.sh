@@ -178,9 +178,10 @@ QARGS=(
   # picker waiting for a root.  With the aperture gone, UEFI falls back to
   # placing 64-bit BARs inside the 32-bit window (0x10000000..0x13ff0000),
   # which our "ranges" already describes.  The price is the RAM above 4G:
-  # highmem=off leaves 3G at 0x40000000..0x100000000, and MEM + the
-  # dram-base/dram-size in gatehouse/dt/build_adt.py (and trestle's QEMU
-  # machine description) have to agree on that.
+  # highmem=off leaves 3G at 0x40000000..0x100000000 with the default MEM.
+  # Gatehouse reads the firmware memory map on every boot and rewrites
+  # /chosen dram-base and dram-size, /pram and the /arm-io window to match,
+  # so MEM is the only place a capacity is chosen.
   -M "virt,gic-version=3,highmem-ecam=off,highmem=off${VIRT_EXTRA:+,$VIRT_EXTRA}"
   -cpu "$CPU"
   -m "$MEM"

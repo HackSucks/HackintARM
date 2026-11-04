@@ -245,3 +245,74 @@ int gh_adt_add_property(u8 *dt, u64 cap, const char *path, const char *name,
 		return -1;
 	return 0;
 }
+
+/* Offset of a property inside `node`, or 0 when it is absent. */
+static u64 adt_find_prop(const u8 *dt, u64 size, u64 node, const char *name,
+    u32 *len)
+{
+	u64 p = node + 8;
+	u64 name_len = gh_strlen(name) + 1;
+	u32 n = adt_rd32(dt + node);
+	u32 i;
+
+	for (i = 0; i < n; i++) {
+		u32 l;
+
+		if (p + ADT_PROP_HDR > size)
+			return 0;
+		l = adt_prop_len(dt, p);
+		if (l == 0x7FFFFFFF || p + ADT_PROP_HDR + l > size)
+			return 0;
+		if (name_len <= 32 && !gh_memcmp(dt + p, name, name_len)) {
+			if (len)
+				*len = l;
+			return p;
+		}
+		p += adt_prop_advance(dt, p);
+	}
+	return 0;
+}
+
+int gh_adt_set_property(u8 *dt, u64 cap, const char *path, const char *name,
+    const void *value, u32 len, u64 *size)
+{
+	u64 node, p;
+	u32 plen = 0;
+
+	if (!dt || !size || !path || !name || !value)
+		return -1;
+	if (*size > cap || adt_node_end(dt, *size, 0, 0) != *size)
+		return -1;
+
+	node = adt_find_path(dt, *size, path);
+	if (!node)
+		return -1;
+
+	p = adt_find_prop(dt, *size, node, name, &plen);
+	if (!p)
+		return gh_adt_add_property(dt, cap, path, name, value, len,
+		    size);
+
+	/*
+	 * Only an in-place edit is safe here: growing or shrinking the value
+	 * would move every byte after it, and the caller may already hold
+	 * pointers into the tree (boot_args->deviceTreeP does).
+	 */
+	if (plen != len)
+		return -1;
+	gh_memcpy(dt + p + ADT_PROP_HDR, value, len);
+	return 0;
+}
+
+int gh_adt_get_property(const u8 *dt, u64 size, const char *path,
+    const char *name, const u8 **value, u32 *len)
+{
+	u64 node;
+
+	if (!dt || !path || !name)
+		return -1;
+	node = adt_find_path(dt, size, path);
+	if (!node)
+		return -1;
+	return adt_get_prop(dt, size, node, name, value, len);
+}

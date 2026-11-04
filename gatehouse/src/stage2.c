@@ -16,11 +16,18 @@
  * reached the device and Trestle's front-end gets to answer it.  The rest of
  * the PCIe MMIO window stays mapped, so QEMU's BAR placement is unaffected.
  *
+ * Nothing here names a machine.  The RAM window comes from memory.c, which
+ * read the firmware map, so the same map describes QEMU with any -m, an
+ * Apple Silicon machine, or a board.  RAM is Normal and everything else is
+ * Device-nGnRnE; RAM edges get 4 KiB pages so no byte outside the window is
+ * ever reported as cacheable memory.
+ *
  * Granule: 4 KiB.  With T0SZ=25 the walk starts at level 1 and covers a
- * 39-bit IPA, which is more than the 4 GiB this machine has.  The device
- * region below 1 GiB uses 2 MiB blocks, except the one block that contains
- * the two windows, which gets a 4 KiB table so only the windows are absent.
- * RAM is three 1 GiB blocks.
+ * 39-bit IPA (512 GiB), which is every machine this loader targets.  Whole
+ * 1 GiB blocks use block descriptors; a block that only partly covers RAM
+ * gets an L2 table of 2 MiB blocks, and the two partial 2 MiB chunks at the
+ * edges get L3 tables.  The Lantern 2 MiB chunk always gets an L3 table so
+ * exactly the two windows are absent.
  */
 #include "gh.h"
 
@@ -44,18 +51,23 @@
 #define S2_MEMATTR_DEVICE 0x0ull
 #define S2_MEMATTR_NORMAL 0xfull
 
-/* IPA layout of the bring-up machine (see gatehouse/dt/build_adt.py). */
-#define GH_DEVICE_BASE 0x00000000ull
-#define GH_RAM_BASE    0x40000000ull
-#define GH_RAM_SIZE    0x0c0000000ull	/* 3 GiB, 0x40000000..0x100000000 */
-
 #define S2_ENTRIES     512
+#define S2_PAGE_4K     (1ull << 12)
 #define S2_BLOCK_2M    (1ull << 21)
 #define S2_BLOCK_1G    (1ull << 30)
 
+/* A LANTERN_BLOCK is only ever one 2 MiB chunk, and at most two RAM edges
+ * need an L2 and two more L3 tables.  The pools are generous because a
+ * missing table would silently drop memory; the builder logs if it runs out
+ * instead of corrupting a neighbour. */
+#define S2_MAX_L2      8
+#define S2_MAX_L3      16
+
 static u64 s2_l1[S2_ENTRIES] __attribute__((aligned(4096)));
-static u64 s2_l2_dev[S2_ENTRIES] __attribute__((aligned(4096)));
-static u64 s2_l3_lantern[S2_ENTRIES] __attribute__((aligned(4096)));
+static u64 s2_l2_pool[S2_MAX_L2][S2_ENTRIES] __attribute__((aligned(4096)));
+static u64 s2_l3_pool[S2_MAX_L3][S2_ENTRIES] __attribute__((aligned(4096)));
+static u32 s2_l2_used;
+static u32 s2_l3_used;
 
 static u64 s2_block(u64 pa, u64 attr)
 {
@@ -67,41 +79,156 @@ static u64 s2_page(u64 pa, u64 attr)
 	return pa | attr | S2_DESC_PAGE;
 }
 
+static u64 *s2_alloc_l2(void)
+{
+	if (s2_l2_used >= S2_MAX_L2)
+		return 0;
+	return s2_l2_pool[s2_l2_used++];
+}
+
+static u64 *s2_alloc_l3(void)
+{
+	if (s2_l3_used >= S2_MAX_L3)
+		return 0;
+	return s2_l3_pool[s2_l3_used++];
+}
+
+static int s2_in_ram(u64 pa, u64 base, u64 top)
+{
+	return pa >= base && pa < top;
+}
+
+static int s2_is_lantern(u64 pa)
+{
+	return (pa >= GH_LANTERN_GFX_BASE &&
+		pa < GH_LANTERN_GFX_BASE + GH_LANTERN_WINDOW_SIZE) ||
+	       (pa >= GH_LANTERN_IOSFC_BASE &&
+		pa < GH_LANTERN_IOSFC_BASE + GH_LANTERN_WINDOW_SIZE);
+}
+
+/* Fill one 2 MiB chunk with 4 KiB pages: RAM is Normal, the Lantern windows
+ * are absent, everything else is Device.  Used at RAM edges and for the
+ * Lantern chunk, where block granularity is too coarse. */
+static void s2_fill_pages(u64 *l3, u64 chunk, u64 base, u64 top, u64 dev,
+    u64 ram)
+{
+	u32 i;
+
+	for (i = 0; i < S2_ENTRIES; i++) {
+		u64 pa = chunk + (u64)i * S2_PAGE_4K;
+
+		if (s2_is_lantern(pa))
+			l3[i] = 0;
+		else if (s2_in_ram(pa, base, top))
+			l3[i] = s2_page(pa, ram);
+		else
+			l3[i] = s2_page(pa, dev);
+	}
+}
+
+static void s2_build_l2(u64 *l2, u64 blk, u64 base, u64 top, u64 dev,
+    u64 ram)
+{
+	u32 i;
+
+	for (i = 0; i < S2_ENTRIES; i++) {
+		u64 chunk = blk + (u64)i * S2_BLOCK_2M;
+		u64 end = chunk + S2_BLOCK_2M;
+
+		if (s2_is_lantern(chunk) || s2_is_lantern(end - 1) ||
+		    (chunk <= GH_LANTERN_GFX_BASE &&
+		     end > GH_LANTERN_GFX_BASE)) {
+			u64 *l3 = s2_alloc_l3();
+
+			if (!l3) {
+				gh_log("stage 2: out of L3 tables\n");
+				l2[i] = 0;
+				continue;
+			}
+			s2_fill_pages(l3, chunk, base, top, dev, ram);
+			l2[i] = (u64)l3 | S2_DESC_TABLE;
+		} else if (base <= chunk && end <= top) {
+			l2[i] = s2_block(chunk, ram);
+		} else if (end <= base || chunk >= top) {
+			l2[i] = s2_block(chunk, dev);
+		} else {
+			u64 *l3 = s2_alloc_l3();
+
+			if (!l3) {
+				gh_log("stage 2: out of L3 tables\n");
+				l2[i] = 0;
+				continue;
+			}
+			s2_fill_pages(l3, chunk, base, top, dev, ram);
+			l2[i] = (u64)l3 | S2_DESC_TABLE;
+		}
+	}
+}
+
 void gh_stage2_init(void)
 {
-	const u64 lantern_block = GH_LANTERN_GFX_BASE & ~(S2_BLOCK_2M - 1);
+	const u64 lantern2m = GH_LANTERN_GFX_BASE & ~(S2_BLOCK_2M - 1);
 	const u64 dev = S2_AF | S2_AP_RW | S2_MEMATTR(S2_MEMATTR_DEVICE);
 	const u64 ram = S2_AF | S2_AP_RW | S2_SH_INNER |
 			S2_MEMATTR(S2_MEMATTR_NORMAL);
+	u64 base = gh_memory_base();
+	u64 top = gh_memory_top();
 	u64 i;
 	u64 vtcr;
 	u64 hcr;
 
-	/* 0..1 GiB: every 2 MiB block of device space, by default. */
-	for (i = 0; i < S2_ENTRIES; i++)
-		s2_l2_dev[i] = s2_block(GH_DEVICE_BASE + i * S2_BLOCK_2M, dev);
-
-	/* The block holding both Lantern windows: 4 KiB pages, so exactly the
-	 * windows are absent and the rest of that 2 MiB stays usable. */
-	for (i = 0; i < S2_ENTRIES; i++) {
-		u64 pa = lantern_block + i * 4096;
-
-		if (pa >= GH_LANTERN_GFX_BASE &&
-		    pa < GH_LANTERN_IOSFC_BASE + GH_LANTERN_WINDOW_SIZE)
-			s2_l3_lantern[i] = 0;
-		else
-			s2_l3_lantern[i] = s2_page(pa, dev);
+	if (!base || top <= base) {
+		gh_log("stage 2: no RAM window, refusing to map\n");
+		for (;;)
+			__asm__ volatile("wfi");
 	}
-	s2_l2_dev[(lantern_block >> 21) & 0x1ff] =
-	    (u64)s2_l3_lantern | S2_DESC_TABLE;
+	if (top > (1ull << 39)) {
+		gh_log("stage 2: RAM above the 39-bit IPA, clamping\n");
+		top = 1ull << 39;
+	}
 
-	s2_l1[0] = (u64)s2_l2_dev | S2_DESC_TABLE;
+	/* Identity map for the whole IPA: devices by default.  RAM blocks are
+	 * overwritten below.  There is no per-machine address table. */
+	for (i = 0; i < S2_ENTRIES; i++)
+		s2_l1[i] = s2_block(i * S2_BLOCK_1G, dev);
 
-	/* RAM: three 1 GiB blocks, normal memory. */
-	for (i = 0; i < GH_RAM_SIZE / S2_BLOCK_1G; i++) {
-		u64 pa = GH_RAM_BASE + i * S2_BLOCK_1G;
+	/* The Lantern chunk, first: its 2 MiB block always needs pages. */
+	{
+		u64 blk = lantern2m & ~(S2_BLOCK_1G - 1);
+		u64 *l2 = s2_alloc_l2();
 
-		s2_l1[(pa >> 30) & 0x1ff] = s2_block(pa, ram);
+		if (!l2) {
+			gh_log("stage 2: out of L2 tables for Lantern\n");
+		} else {
+			s2_build_l2(l2, blk, base, top, dev, ram);
+			s2_l1[(blk >> 30) & 0x1ff] = (u64)l2 | S2_DESC_TABLE;
+		}
+	}
+
+	/* RAM: whole 1 GiB blocks stay blocks; the two edge blocks get 2 MiB
+	 * tables so only real memory is Normal. */
+	if (base < top) {
+		u64 first = base / S2_BLOCK_1G;
+		u64 last = (top - 1) / S2_BLOCK_1G;
+
+		for (i = first; i <= last; i++) {
+			u64 blk = i * S2_BLOCK_1G;
+
+			if (blk == (lantern2m & ~(S2_BLOCK_1G - 1)))
+				continue;	/* already page-mapped */
+			if (base <= blk && blk + S2_BLOCK_1G <= top) {
+				s2_l1[i] = s2_block(blk, ram);
+			} else {
+				u64 *l2 = s2_alloc_l2();
+
+				if (!l2) {
+					gh_log("stage 2: out of L2 tables\n");
+					continue;
+				}
+				s2_build_l2(l2, blk, base, top, dev, ram);
+				s2_l1[i] = (u64)l2 | S2_DESC_TABLE;
+			}
+		}
 	}
 
 	/*
@@ -139,5 +266,7 @@ void gh_stage2_init(void)
 
 	gh_loghex("stage 2         : ", (u64)s2_l1);
 	gh_loghex("stage 2 vtcr    : ", vtcr);
+	gh_loghex("stage 2 ram     : ", base);
+	gh_loghex("stage 2 ram top : ", top);
 	gh_loghex("stage 2 windows : ", GH_LANTERN_GFX_BASE);
 }

@@ -33,4 +33,10 @@
 trestle_machine *trestle_machine_qemu_virt(void);
 trestle_machine *trestle_machine_avp(void);
 
+// Fill in the boot's memory facts.  Gatehouse reads the firmware memory map
+// and passes the largest usable run; the /arm-io window is kept ending where
+// RAM begins.  A boot with no firmware map leaves the description's defaults,
+// which describe the machine the description was written for.
+void trestle_machine_set_memory(trestle_machine *m, u64 base, u64 size);
+
 #endif // TRESTLE_MACHINES_H

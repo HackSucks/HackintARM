@@ -16,12 +16,12 @@
 static EFI_SYSTEM_TABLE *ST;
 static EFI_BOOT_SERVICES *BS;
 
-/* Where the kernel image lands (V=P).  Must be 16K aligned. */
-#define GH_KERN_PHYS_BASE   0x80000000ULL
+/* Where the kernel image lands (V=P), chosen from the machine's RAM at run
+ * time: the middle of the largest usable run, adjusted so the mach header
+ * keeps the link-time congruence XNU's bootstrap mapping requires.  There is
+ * deliberately no fixed base: a real machine may put RAM anywhere. */
 /* L2 block size for XNU's bootstrap page tables (16 KB granule). */
 #define GH_BOOT_L2_BLOCK    0x2000000ULL
-#define GH_EFI_PAGE         0x1000ULL  /* UEFI allocation granularity  */
-#define GH_PAGE             0x4000ULL  /* XNU's 16 KiB translation granule */
 #define GH_DT_MAX           0x00100000ULL  /* 1 MiB device tree ceiling */
 
 /* iBoot's panic region.  XNU's check_for_panic_log() (pexpert/arm/pe_init.c)
@@ -36,10 +36,9 @@ static EFI_BOOT_SERVICES *BS;
  * window to the VM allocator, so the log survives.  The offset must clear the
  * largest image we ever load -- a macOS 27 VMApple kernel collection is 81.4
  * MiB -- plus the device tree and boot_args, hence 88 MiB here.
- * build_adt.py emits the same two constants -- the checks below catch any
- * drift. */
+ * build_adt.py emits the same offset as a placeholder; Gatehouse overwrites
+ * /pram with the address the image actually landed at. */
 #define GH_PANIC_OFF        0x05800000ULL  /* from the image base (88 MiB) */
-#define GH_PANIC_PHYS       (0x81004000ULL + GH_PANIC_OFF)
 #define GH_PANIC_SIZE       0x00080000ULL  /* 512 KiB, as iBoot uses */
 
 /* debug flags: 0x100 DB_KDP_GETC_ENA, 0x40 DB_KDP_BP_DIS, 0x08 DB_KPRT,
@@ -225,53 +224,6 @@ static void *read_file(EFI_FILE_PROTOCOL *root, const CHAR16 *path,
 
 /* ------------------------------------------------------------------ */
 
-static void scan_memory(u64 *ram_base, u64 *ram_top)
-{
-	UINTN map_sz = 0, key_sz = 0, desc_sz = 0;
-	UINT32 desc_ver = 0;
-	EFI_MEMORY_DESCRIPTOR *map = 0, *d;
-	EFI_STATUS s;
-	u64 lo = ~0ULL, hi = 0;
-
-	s = BS->GetMemoryMap(&map_sz, 0, &key_sz, &desc_sz, &desc_ver);
-	if (s != EFI_BUFFER_TOO_SMALL) {
-		gh_loghex("GetMemoryMap(size) unexpected: ", s);
-		return;
-	}
-	map_sz += 8 * desc_sz;
-	s = BS->AllocatePool(2, map_sz, (void **)&map);
-	if (EFI_ERROR(s)) {
-		gh_loghex("AllocatePool(map) failed: ", s);
-		return;
-	}
-	s = BS->GetMemoryMap(&map_sz, map, &key_sz, &desc_sz, &desc_ver);
-	if (EFI_ERROR(s)) {
-		gh_loghex("GetMemoryMap failed: ", s);
-		return;
-	}
-	for (d = map; (u8 *)d < (u8 *)map + map_sz;
-	    d = (EFI_MEMORY_DESCRIPTOR *)((u8 *)d + desc_sz)) {
-		u64 start = d->PhysicalStart;
-		/* EFI_MEMORY_DESCRIPTOR counts 4 KiB pages, not XNU's 16 KiB. */
-		u64 end = start + d->NumberOfPages * GH_EFI_PAGE;
-		if (d->Type == 7 /* EfiConventionalMemory */ ||
-		    d->Type == 2 /* EfiLoaderData */ ||
-		    d->Type == 3 || d->Type == 4 || d->Type == 5 || d->Type == 6) {
-			if (start < lo) {
-				lo = start;
-			}
-			if (end > hi) {
-				hi = end;
-			}
-		}
-	}
-	*ram_base = lo;
-	*ram_top = hi;
-	BS->FreePool(map);
-}
-
-/* ------------------------------------------------------------------ */
-
 /*
  * Ask the firmware to make a range executable (and writable).  AAVMF maps
  * EfiLoaderData as no-execute, so the kernel image we just copied would fault
@@ -349,6 +301,17 @@ static void wr32le(u8 *p, u32 v)
 	p[1] = (u8)((v >> 8) & 0xff);
 	p[2] = (u8)((v >> 16) & 0xff);
 	p[3] = (u8)((v >> 24) & 0xff);
+}
+
+static u64 rd64le(const u8 *p)
+{
+	return (u64)rd32le(p) | ((u64)rd32le(p + 4) << 32);
+}
+
+static void wr64le(u8 *p, u64 v)
+{
+	wr32le(p, (u32)v);
+	wr32le(p + 4, (u32)(v >> 32));
 }
 
 /* Read one DER TLV.  IMG4 uses definite lengths only (short form or
@@ -603,7 +566,6 @@ static int load_and_jump(void)
 	EFI_STATUS s;
 	u64 dt_phys, ba_phys, top_of_kernel;
 	u8 *p;
-	u64 ram_base = 0, ram_top = 0;
 	u64 tc_phys = 0, tc_len = 0;
 	const u8 *rd_payload = 0;
 	u64 rd_len = 0, rd_off = 0;
@@ -644,9 +606,9 @@ static int load_and_jump(void)
 	 *
 	 *   [trust cache][image][device tree][boot_args] ... [panic log][ramdisk]
 	 *
-	 * The panic region sits at a fixed offset from the image base because
-	 * build_adt.py bakes its address into /pram (XNU reads it there); the
-	 * check below fails loudly if the two ever drift apart.
+	 * The panic region sits at a fixed offset from the image base, and
+	 * Gatehouse writes /pram from the address the image actually landed
+	 * at (the tree is a template, not a layout).
 	 *
 	 * A restore ramdisk, when the ESP carries one, goes above the panic log
 	 * and inside the same window: arm_vm_physmap_init() maps everything from
@@ -679,26 +641,117 @@ static int load_and_jump(void)
 	npages = (alloc_sz + GH_EFI_PAGE - 1) / GH_EFI_PAGE;
 
 	/*
-	 * XNU builds its bootstrap KVA mapping out of L2 block descriptors
-	 * (32 MB with the 16 KB granule) and maps virtualBase to physBase one
-	 * block at a time.  It also computes every kernel address as
-	 * "physical + (virtualBase - physBase)", while the addresses baked into
-	 * the Mach-O are the virtual ones.  Together those force the physical
-	 * base of the mach header to be congruent to the link base modulo the
-	 * L2 block size; iBoot guarantees this on real hardware and XNU is
-	 * entitled to assume it.  A 16 KB offset here silently shifts the whole
-	 * KVA mapping into unmapped memory, so pick such an address explicitly.
+	 * Ask the firmware what RAM this machine has.  Everything below --
+	 * the kernel window, /chosen dram-base and dram-size, the stage-2
+	 * map -- is derived from this answer; no build-time constant guesses
+	 * the machine.
+	 */
+	if (gh_memory_discover(BS) != 0) {
+		gh_log("cannot determine the machine's RAM\n");
+		return -1;
+	}
+	gh_loghex("RAM base        : ", gh_memory_base());
+	gh_loghex("RAM top         : ", gh_memory_top());
+
+	/*
+	 * Pick the physical base of the kernel image.  The constraints are in
+	 * the block below; the short version is that the mach header's
+	 * physical address has to be congruent to its link address modulo the
+	 * L2 block size, and the whole window has to fit in the machine's RAM.
 	 */
 	{
-		u64 plane = GH_BOOT_L2_BLOCK;
-		u64 low = m.link_base & (plane - 1);
+		/*
+		 * XNU builds its bootstrap KVA mapping out of L2 block
+		 * descriptors (32 MB with the 16 KB granule) and maps
+		 * virtualBase to physBase one block at a time.  It also
+		 * computes every kernel address as "physical + (virtualBase -
+		 * physBase)", while the addresses baked into the Mach-O are
+		 * the virtual ones.  Together those force the physical base of
+		 * the mach header to be congruent to the link base modulo the
+		 * L2 block size; iBoot guarantees this on real hardware and
+		 * XNU is entitled to assume it.  A 16 KB offset here silently
+		 * shifts the whole KVA mapping into unmapped memory, so every
+		 * candidate is congruent by construction.
+		 *
+		 * The middle of the machine's RAM is the first choice: it
+		 * leaves the largest possible room above for firmware runtime
+		 * data and below for the banner and boot objects, and it is
+		 * where iBoot's own layout lands on the bring-up machine.
+		 * Firmware may already own pages there, so walk outwards until
+		 * the allocation succeeds, staying inside the RAM window.
+		 */
+		const u64 plane = GH_BOOT_L2_BLOCK;
+		const u64 low = m.link_base & (plane - 1);
+		const u64 base = gh_memory_base();
+		const u64 top = gh_memory_top();
+		u64 lo_lim, up_lim, lim, cand, c;
+		int found = 0;
 
-		img = (GH_KERN_PHYS_BASE & ~(plane - 1)) + low;
-		gh_loghex("image phys want : ", img);
-		s = BS->AllocatePages(2 /* AllocateAddress */,
-		    1 /* EfiLoaderCode */, npages, &img);
-		if (EFI_ERROR(s)) {
-			gh_loghex("AllocatePages(image) failed: ", s);
+		if (low & (GH_PAGE - 1)) {
+			gh_log("kernel window: link base is not 16K aligned\n");
+			return -1;
+		}
+		if (top <= base || alloc_sz > top - base) {
+			gh_log("kernel window: does not fit in RAM\n");
+			return -1;
+		}
+
+		/* Smallest/largest congruent addresses that still fit. */
+		lim = top - alloc_sz;
+		if (lim < low) {
+			gh_log("kernel window: no congruent address fits\n");
+			return -1;
+		}
+		lo_lim = (base & ~(plane - 1)) + low;
+		if (lo_lim < base)
+			lo_lim += plane;
+		up_lim = (lim & ~(plane - 1)) + low;
+		if (up_lim > lim) {
+			if (up_lim < plane) {
+				gh_log("kernel window: no congruent address fits\n");
+				return -1;
+			}
+			up_lim -= plane;
+		}
+
+		cand = ((base + (top - base) / 2) & ~(plane - 1)) + low;
+		if (cand < lo_lim)
+			cand = lo_lim;
+		if (cand > up_lim)
+			cand = up_lim;
+		if (cand < lo_lim) {
+			gh_log("kernel window: no congruent address fits\n");
+			return -1;
+		}
+
+		for (c = cand; c >= lo_lim && c <= up_lim; c -= plane) {
+			EFI_PHYSICAL_ADDRESS pa = c;
+
+			s = BS->AllocatePages(2 /* AllocateAddress */,
+			    1 /* EfiLoaderCode */, npages, &pa);
+			if (!EFI_ERROR(s)) {
+				img = c;
+				found = 1;
+				break;
+			}
+			if (c < plane)
+				break;
+		}
+		if (!found) {
+			for (c = cand + plane; c <= up_lim; c += plane) {
+				EFI_PHYSICAL_ADDRESS pa = c;
+
+				s = BS->AllocatePages(2 /* AllocateAddress */,
+				    1 /* EfiLoaderCode */, npages, &pa);
+				if (!EFI_ERROR(s)) {
+					img = c;
+					found = 1;
+					break;
+				}
+			}
+		}
+		if (!found) {
+			gh_log("no free RAM for the kernel window\n");
 			return -1;
 		}
 	}
@@ -885,16 +938,65 @@ static int load_and_jump(void)
 		}
 	}
 
+	/*
+	 * The tree is a template.  The machine's DRAM window, the panic
+	 * region's address and the SoC window that ends where RAM begins all
+	 * depend on the firmware map and on where the image landed, so patch
+	 * them here, before XNU sees the tree.  Every edit is in place: no
+	 * property grows or shrinks, so boot_args->deviceTreeP stays valid.
+	 */
+	if (dtsize) {
+		u64 dram[2];
+		u64 pram[2];
+		u8 ranges[24];
+		const u8 *old = 0;
+		u32 old_len = 0;
+
+		dram[0] = gh_memory_base();
+		dram[1] = gh_memory_size();
+		pram[0] = img + panic_off;
+		pram[1] = GH_PANIC_SIZE;
+
+		if (gh_adt_set_property((u8 *)dt_phys, GH_DT_MAX, "chosen",
+		    "dram-base", &dram[0], sizeof(dram[0]), &dtsize) != 0 ||
+		    gh_adt_set_property((u8 *)dt_phys, GH_DT_MAX, "chosen",
+		    "dram-size", &dram[1], sizeof(dram[1]), &dtsize) != 0)
+			gh_log("device tree     : could not set the dram window\n");
+
+		if (gh_adt_set_property((u8 *)dt_phys, GH_DT_MAX, "pram",
+		    "reg", pram, sizeof(pram), &dtsize) != 0)
+			gh_log("device tree     : could not set the panic region\n");
+
+		/*
+		 * /arm-io "ranges" is { child 0, SoC base, window size }: the
+		 * device window runs from the SoC base to the start of RAM.
+		 * XNU resolves every arm-io child's reg through it, so a
+		 * machine whose RAM begins somewhere else needs it to match.
+		 */
+		if (gh_adt_get_property((const u8 *)dt_phys, dtsize, "arm-io",
+		    "ranges", &old, &old_len) == 0 &&
+		    old_len == sizeof(ranges)) {
+			u64 soc;
+
+			gh_memcpy(ranges, old, sizeof(ranges));
+			soc = rd64le(ranges + 8);
+			if (gh_memory_base() > soc) {
+				wr64le(ranges + 16,
+				    gh_memory_base() - soc);
+				if (gh_adt_set_property((u8 *)dt_phys,
+				    GH_DT_MAX, "arm-io", "ranges", ranges,
+				    sizeof(ranges), &dtsize) != 0)
+					gh_log("device tree     : could not set "
+					    "the arm-io window\n");
+			}
+		}
+
+		gh_loghex("dram base       : ", dram[0]);
+		gh_loghex("dram size       : ", dram[1]);
+	}
+
 	/* boot args */
 	ba_phys = img + ba_off;
-	scan_memory(&ram_base, &ram_top);
-	gh_loghex("RAM base        : ", ram_base);
-	gh_loghex("RAM top         : ", ram_top);
-	if (!ram_base || ram_top <= ram_base) {
-		/* fall back to the QEMU virt RAM window */
-		ram_base = 0x40000000ULL;
-		ram_top = 0xC0000000ULL;
-	}
 	{
 		/*
 		 * The boot_args window starts at the bottom of the boot data,
@@ -1011,25 +1113,24 @@ static int load_and_jump(void)
 		}
 		cmdline[cn] = 0;
 
-		/* The panic region the ADT advertises must be where we expect
-		 * the image to be, must not collide with the image, device
-		 * tree, boot_args or trust cache, and must stay inside
+		/* The panic region the ADT advertises must be where the image
+		 * landed, must not collide with the image, device tree,
+		 * boot_args or trust cache, and must stay inside
 		 * topOfKernelData. */
-		if (img + panic_off != GH_PANIC_PHYS ||
-		    GH_PANIC_PHYS < img + boot_off ||
-		    (tc_len && GH_PANIC_PHYS < tc_phys + tc_len) ||
-		    GH_PANIC_PHYS + GH_PANIC_SIZE > top_of_boot) {
+		if (img + panic_off < img + boot_off ||
+		    (tc_len && img + panic_off < tc_phys + tc_len) ||
+		    img + panic_off + GH_PANIC_SIZE > top_of_boot) {
 			gh_uart_puts("bad panic region placement\n");
 			return 1;
 		}
-		gh_loghex("panic region    : ", GH_PANIC_PHYS);
+		gh_loghex("panic region    : ", img + panic_off);
 
 		gh_loghex("kernel window   : ", win_base);
 		gh_loghex("kernel window VA: ", win_virt);
 		gh_loghex("device tree VA  : ", dt_va);
 		sz = gh_bootargs_build((void *)ba_phys, win_virt, win_base,
-		    ram_top - win_base, top_of_boot, dt_va, (u32)dtsize,
-		    cmdline);
+		    gh_memory_top() - win_base, top_of_boot, dt_va,
+		    (u32)dtsize, cmdline);
 		gh_uart_puts("boot_args size  : ");
 		gh_uart_putdec((u64)sz);
 		nl();

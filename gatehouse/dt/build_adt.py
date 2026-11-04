@@ -297,7 +297,7 @@ PHANDLE_OSENVIRONMENTS = 0x4C
 # "pe_init.c: Assertion failed: panic_info" and the panic path cannot even
 # print the panic text.  Gatehouse reserves these bytes inside the boot-data
 # window below topOfKernelData (main.c checks the same constants).
-KERN_IMG_PHYS = 0x81004000         # GH_KERN_PHYS_BASE + 0x1004000
+KERN_IMG_PHYS = 0x81004000         # template value; Gatehouse patches /pram
 PANIC_PHYS = KERN_IMG_PHYS + 0x05800000   # GH_PANIC_OFF (88 MiB: clear of an 81 MiB kernel collection)
 PANIC_SIZE = 0x00080000            # 512 KiB
 
@@ -306,16 +306,22 @@ PANIC_SIZE = 0x00080000            # 512 KiB
 # uses them to decide whether a physical page is cacheable DRAM or device
 # memory (wimg_to_pte) and to seed pmap_first_pnum = dram-base >> 14.
 #
-# Must agree with the RAM QEMU is actually providing.  The machine runs with
-# "highmem=off" and MEM=3G (see qemu/run.sh): with highmem on, QEMU's PCI bus
-# also gains a 64-bit MMIO aperture at 0x8000000000, and UEFI puts the modern
-# virtio BAR (BAR4, 64-bit prefetchable, 16 MB, where the modern transport
-# lives) up there -- far outside the single 32-bit "ranges" window the
-# reference platform describes for /arm-io/pcie.  The guest then has no
-# IODeviceMemory for the transport and the root disk never appears as an
-# IOMedia.  highmem=off removes that aperture, so UEFI falls back to placing
-# 64-bit BARs inside the 32-bit window (which is where Apple's own devices
-# live), at the cost of the RAM above 4G: 3G at 0x40000000..0x100000000.
+# These values are a template, not a fact about the machine: Gatehouse reads
+# the firmware memory map at boot, picks the largest usable run, and rewrites
+# this property, /pram and the /arm-io window in place.  They stay here so a
+# tree used without Gatehouse (the model tests, tools/adt_diff.py) is still
+# well-formed, and they describe the QEMU virt layout below.
+#
+# The machine runs with "highmem=off" (see qemu/run.sh): with highmem on,
+# QEMU's PCI bus also gains a 64-bit MMIO aperture at 0x8000000000, and UEFI
+# puts the modern virtio BAR (BAR4, 64-bit prefetchable, 16 MB, where the
+# modern transport lives) up there -- far outside the single 32-bit "ranges"
+# window the reference platform describes for /arm-io/pcie.  The guest then
+# has no IODeviceMemory for the transport and the root disk never appears as
+# an IOMedia.  highmem=off removes that aperture, so UEFI falls back to
+# placing 64-bit BARs inside the 32-bit window (which is where Apple's own
+# devices live), at the cost of the RAM above 4G: 3G at
+# 0x40000000..0x100000000 with the default MEM=3G.
 RAM_BASE = 0x40000000
 RAM_SIZE = 0xC0000000
 

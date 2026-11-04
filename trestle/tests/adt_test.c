@@ -324,6 +324,30 @@ int main(int argc, char **argv)
            TRESTLE_ADT_NO_NODE);
     assert(trestle_adt_find(&adt, "/arm-io/pvpanic") == TRESTLE_ADT_NO_NODE);
 
+    // A boot tells the machine what memory this instance actually has, and
+    // the tree and the /arm-io window follow.  Gatehouse supplies the largest
+    // usable run from the firmware memory map, so this is where a machine
+    // with unusual RAM gets described correctly.
+    {
+        trestle_machine *mm = trestle_machine_qemu_virt();
+
+        trestle_machine_set_memory(mm, 0x800000000ull, 0x40000000ull);
+        assert(mm->ram_base == 0x800000000ull);
+        assert(mm->ram_size == 0x40000000ull);
+        assert(mm->soc_size == 0x800000000ull - mm->soc_base);
+
+        assert(trestle_adt_init(&adt, data, sizeof(data), props,
+                                TRESTLE_ARRAY_SIZE(props), nodes,
+                                TRESTLE_ARRAY_SIZE(nodes)) == TRESTLE_OK);
+        build_into(&adt, mm);
+        assert(prop_u64(&adt, "/chosen", "dram-base") == 0x800000000ull);
+        assert(prop_u64(&adt, "/chosen", "dram-size") == 0x40000000ull);
+
+        // Restore the machine the rest of the test describes.
+        mm = trestle_machine_qemu_virt();
+        trestle_machine_set_memory(mm, 0x40000000ull, 0xC0000000ull);
+    }
+
     if (argc > 1) {
         FILE *f = fopen(argv[1], "wb");
 
