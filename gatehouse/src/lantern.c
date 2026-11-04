@@ -191,6 +191,23 @@ static void lantern_count(struct lantern_dev *dev, int write)
 	}
 }
 
+/*
+ * Pending an SPI in the GIC distributor.  HCR_EL2.IMO is 0, so a physical
+ * IRQ is delivered straight to the guest at EL1; Trestle has to do nothing
+ * else on the return path.  The guest's driver installed its handler before
+ * it configured the device, so the next instruction at EL1 can take it.
+ */
+static void lantern_pend_gic(u32 id)
+{
+	volatile u32 *ispendr =
+	    (volatile u32 *)(GH_GICD_BASE + 0x200u + 4u * (id / 32u));
+
+	*ispendr = 1u << (id % 32u);
+	gh_uart_puts("lantern: pended irq ");
+	gh_uart_puthex(id);
+	gh_uart_putc('\n');
+}
+
 u64 gh_lantern_mmio_read(u64 ipa, u32 size, u64 pc)
 {
 	u32 off = 0;
@@ -247,6 +264,14 @@ void gh_lantern_mmio_write(u64 ipa, u32 size, u64 value, u64 pc)
 				gh_log("lantern: first doorbell; no host to "
 				       "service it yet\n");
 			lantern_doorbells++;
+		} else if (off == GFX_FIFO_ENABLE && (u32)value == 1u) {
+			/* Probe the interrupt path: the driver has set up
+			 * its handler and is about to block on a stamp.
+			 * Pending the SPI proves EL2 -> GIC -> EL1 delivery
+			 * without the virtual CPU interface. */
+			if ((slot = gfx_shadow_slot(off)) >= 0)
+				gfx_shadow[slot] = (u32)value;
+			lantern_pend_gic(GH_LANTERN_IRQ_GFX);
 		} else if (gfx_is_storage(off) &&
 			   (slot = gfx_shadow_slot(off)) >= 0) {
 			gfx_shadow[slot] = (u32)value;

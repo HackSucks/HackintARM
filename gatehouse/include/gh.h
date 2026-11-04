@@ -61,6 +61,12 @@ void gh_stage2_init(void);
 #define GH_LANTERN_IOSFC_BASE   0x0b010000ull
 #define GH_LANTERN_WINDOW_SIZE  0x00010000ull
 
+/* The GIC distributor, for pending a guest interrupt from EL2.  QEMU virt's
+ * GICD; the authentic VMApple machine places it at 0x10000000.  Machine
+ * description, like the windows above. */
+#define GH_GICD_BASE            0x08000000ull
+#define GH_LANTERN_IRQ_GFX      0x31u
+
 /* lantern.c */
 /* pc is the guest's ELR_EL2 for the trapped access, kept for the trace so a
  * register access can be traced back to the kernel function that made it. */

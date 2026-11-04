@@ -275,6 +275,22 @@ marked "may call back". It must not wait for a host thread that is itself in a
 call on the device, and the device's signal lock is held, so one device's
 raises never run concurrently.
 
+**Measured injection path (Trestle).** Writing the SPI's bit in
+`GICD_ISPENDRn` from EL2 is enough to deliver it to EL1. Trestle runs with
+`HCR_EL2.IMO = 0`, so a physical interrupt is not routed to EL2; the GIC
+delivers it straight to the guest, and no virtual CPU interface has to be
+implemented for this path. The front-end only needs the distributor base
+(`GH_GICD_BASE`, a machine-description value: `0x08000000` on QEMU `virt`,
+`0x10000000` on VMApple) and the guest-visible id (SPI 17 for `gfx`, 16 for
+`iosurface-mapper`; GIC ids `0x31`/`0x30`, as the ADT carries them).
+
+The first probe pends `0x31` when the guest enables the FIFO. The carrier
+immediately takes the interrupt and lands in
+`AppleParavirtGPU::setupInterruptsEarly`'s block, which reads `0x1018`,
+`0x1014` and `0x102c` — exactly the registers Phase 1 names. No EL2 trap, no
+fault. The next step replaces this one-shot probe with a real source: the host
+sets a flag in shared RAM, Trestle sees it and pends the SPI.
+
 ### 4.5 Display and frames
 
 A display is created with `rvg_display_create`:
@@ -543,6 +559,14 @@ the device trace. No fault, no panic. The trace line format is
 
 **Done when:** the guest's interrupt handler reads `0x1018`, `0x1014` and
 `0x102c`, and the host sees FIFO doorbells.
+
+**Status (boot 4, 2026-11-04).** The trap path, the register file and
+interrupt delivery are proven. Pending SPI `0x31` on `FIFO_ENABLE` makes the
+guest run `setupInterruptsEarly`'s block and read `0x1018`, `0x1014` and
+`0x102c`; `writeFifo` then writes FIFO_WRITTEN and polls FIFO_READ, which the
+stub never advances. What remains of this phase is making the interrupt
+source real (host flag in shared RAM, not a one-shot probe) and letting the
+FIFO consumer complete the command so FIFO_READ moves.
 
 ### Phase 2 — FIFOs and memory
 
