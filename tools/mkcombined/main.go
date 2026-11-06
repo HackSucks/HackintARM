@@ -38,6 +38,19 @@ type walker struct {
 	vol   *apfs.Volume
 	count int
 	skip  map[string]int
+	// skipPath omits whole subtrees, keyed by image-relative path.  It lets
+	// the cryptex overlay leave System/Library/dyld alone: those caches are
+	// already installed from the (identical) cryptex onto the system volume,
+	// and duplicating the multi-gigabyte cache inside Preboot buys nothing.
+	skipPath map[string]bool
+	// flatten writes every hard-linked name as its own independent file
+	// instead of reproducing the APFS sibling-link records. Bring-up images
+	// use it because the guest's APFS client is sensitive to how a synthetic
+	// writer lays out siblings, and hard-linked launchd property lists (e.g.
+	// com.apple.powerd.plist, which is also inside powerd.bundle) fail lookup
+	// with ENOENT when they are written that way. The cost is one copy of the
+	// file per extra name.
+	flatten bool
 }
 
 func (w *walker) children(dir string) ([]*apfswrite.Entry, error) {
@@ -51,6 +64,10 @@ func (w *walker) children(dir string) ([]*apfswrite.Entry, error) {
 		full := name
 		if dir != "." {
 			full = dir + "/" + name
+		}
+		if w.skipPath[full] {
+			w.skip["skip:"+full]++
+			continue
 		}
 		info, err := de.Info()
 		if err != nil {
@@ -113,7 +130,7 @@ func (w *walker) children(dir string) ([]*apfswrite.Entry, error) {
 				}
 				e.DataValue = &fileValue{r: ra, size: info.Size()}
 			}
-			if inode.NumberOfLinks > 1 {
+			if inode.NumberOfLinks > 1 && !w.flatten {
 				e.LinkGroup = inode.Identifier
 			}
 		default:
@@ -355,6 +372,39 @@ func installHostFile(root *apfswrite.Entry, path, src string) error {
 	return nil
 }
 
+// installHostDecmpfs installs a file in the exact form the sealed SystemOS
+// cryptex stores it: a com.apple.decmpfs header attribute plus the compressed
+// bytes in com.apple.ResourceFork, with an empty data fork.  Nothing is
+// decompressed here.  macOS decodes the file when it is read, which is also how
+// every compressed file copied from the root DMG works, so a cryptex-only file
+// whose payload a host tool cannot decode can still be transplanted verbatim.
+func installHostDecmpfs(root *apfswrite.Entry, path, xattrSrc, forkSrc string) error {
+	xattr, err := os.ReadFile(xattrSrc)
+	if err != nil {
+		return err
+	}
+	fork, err := os.ReadFile(forkSrc)
+	if err != nil {
+		return err
+	}
+	parts := strings.Split(path, "/")
+	mode := os.FileMode(0755)
+	var uid, gid uint32
+	if cur := findEntry(root, path); cur != nil {
+		mode = cur.Mode.Perm()
+		uid, gid = cur.UID, cur.GID
+	}
+	e := &apfswrite.Entry{
+		Name: parts[len(parts)-1], Mode: mode, ModeExplicit: true, UID: uid, GID: gid,
+		Xattrs: map[string][]byte{
+			"com.apple.decmpfs":      xattr,
+			"com.apple.ResourceFork": fork,
+		},
+	}
+	installPath(root, path, e)
+	return nil
+}
+
 // findEntry returns the entry at path under root, or nil.
 func findEntry(root *apfswrite.Entry, path string) *apfswrite.Entry {
 	cur := root
@@ -372,6 +422,32 @@ func findEntry(root *apfswrite.Entry, path string) *apfswrite.Entry {
 		cur = next
 	}
 	return cur
+}
+
+// overlayTree merges src into dst, the way a grafted cryptex overlays the
+// sealed system volume: a cryptex entry replaces the base entry of the same
+// name, except that two directories merge recursively so files that only exist
+// in the base system survive.  It returns the merged slice.
+func overlayTree(dst, src []*apfswrite.Entry) []*apfswrite.Entry {
+	for _, se := range src {
+		idx := -1
+		for i, de := range dst {
+			if de.Name == se.Name {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			dst = append(dst, se)
+			continue
+		}
+		if dst[idx].Mode.IsDir() && se.Mode.IsDir() {
+			dst[idx].Children = overlayTree(dst[idx].Children, se.Children)
+			continue
+		}
+		dst[idx] = se
+	}
+	return dst
 }
 
 func uuidString(u [16]byte) string {
@@ -620,8 +696,17 @@ func main() {
 	dyldDir := flag.String("dyld", "", "host directory to install at System/Library/dyld")
 	var injects multiFlag
 	flag.Var(&injects, "inject", "hostfile:dstpath under the System volume root, repeatable")
+	var prebootFiles multiFlag
+	flag.Var(&prebootFiles, "preboot-file", "hostfile:path under the Preboot per-install directory, repeatable")
+	var cryptexes multiFlag
+	flag.Var(&cryptexes, "cryptex", "cryptex APFS image whose volume-root tree is overlaid onto the System volume, repeatable")
+	var cryptexSkip multiFlag
+	flag.Var(&cryptexSkip, "cryptex-skip", "image-relative path to omit while overlaying cryptexes, repeatable")
+	var decmpfsInjects multiFlag
+	flag.Var(&decmpfsInjects, "inject-decmpfs", "xattrfile|forkfile|dstpath: install a decmpfs-compressed file verbatim, repeatable")
 	iscPath := flag.String("isc", "", "iSC container (tools/mkisc -container) to place before the main container in a GPT disk")
 	dry := flag.Bool("dry", false, "walk only")
+	flatten := flag.Bool("flathardlinks", false, "write hard-linked names as independent files instead of APFS sibling links")
 	flag.Parse()
 
 	container, closer, err := apfs.OpenImage(*src, nil)
@@ -635,10 +720,44 @@ func main() {
 	must(err)
 	group := [16]byte{0x7a, 0x1c, 0x9e, 0x42, 0x3b, 0x5d, 0x4f, 0x60, 0x9d, 0x2e, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66}
 
-	w := &walker{vol: vol, skip: map[string]int{}}
+	t0 := time.Now()
+	elapsed := func(what string) {
+		fmt.Fprintf(os.Stderr, "[%s] %s\n", time.Since(t0).Round(time.Second), what)
+	}
+
+	w := &walker{vol: vol, skip: map[string]int{}, flatten: *flatten}
 	kids, err := w.children(*subtree)
 	must(err)
+	elapsed(fmt.Sprintf("walked base volume: %d entries", w.count))
 	root := &apfswrite.Entry{Children: kids}
+	// A grafted cryptex is a union overlay of its volume root onto the
+	// system volume.  Reconstruct that here instead of depending on the
+	// in-guest graft, which needs the sealed Preboot/IGC layout our
+	// synthetic container does not have.  Files present in both trees come
+	// from the cryptex; directories merge so base-only files survive.
+	var cryptexClosers []io.Closer
+	for _, img := range cryptexes {
+		cc, ccloser, err := apfs.OpenImage(img, nil)
+		must(err)
+		cryptexClosers = append(cryptexClosers, ccloser)
+		cv, err := cc.VolumeBySelector("0")
+		must(err)
+		cw := &walker{vol: cv, skip: map[string]int{}, skipPath: map[string]bool{}, flatten: *flatten}
+		for _, p := range cryptexSkip {
+			cw.skipPath[p] = true
+		}
+		ckids, err := cw.children(".")
+		must(err)
+		root.Children = overlayTree(root.Children, ckids)
+		fmt.Fprintf(os.Stderr, "overlaid cryptex %s: %d entries (skipped: %v)\n",
+			img, cw.count, cw.skip)
+		elapsed(fmt.Sprintf("overlaid cryptex %s", filepath.Base(img)))
+	}
+	defer func() {
+		for _, c := range cryptexClosers {
+			c.Close()
+		}
+	}()
 	if *dyldDir != "" {
 		// macOS 27 no longer ships the dyld shared cache on the System
 		// volume: it lives in the Cryptex1,SystemOS cryptex, which needs
@@ -656,6 +775,32 @@ func main() {
 		}
 		must(installHostFile(root, dst, src))
 		fmt.Fprintf(os.Stderr, "injected %s at %s\n", src, dst)
+	}
+	for _, spec := range decmpfsInjects {
+		parts := strings.Split(spec, "|")
+		if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+			fmt.Fprintf(os.Stderr, "bad -inject-decmpfs %q: want xattrfile|forkfile|dstpath\n", spec)
+			os.Exit(2)
+		}
+		must(installHostDecmpfs(root, parts[2], parts[0], parts[1]))
+		fmt.Fprintf(os.Stderr, "injected decmpfs %s + %s at %s\n", parts[0], parts[1], parts[2])
+	}
+	// Preboot cryptex1/current holds the graftable os.dmg/app.dmg images
+	// together with their IMG4 root-hash seals and trust caches.  libignition
+	// opens cryptex1/current during early boot and grafts what it finds there;
+	// an empty directory is why the VM so far booted with /System/Cryptexes
+	// dangling and a system volume that is missing the cryptex overlay.
+	prebootRoot := &apfswrite.Entry{Children: []*apfswrite.Entry{
+		dirEntry("boot"), dirEntry("cryptex1", dirEntry("current")), dirEntry("restore"),
+	}}
+	for _, spec := range prebootFiles {
+		src, dst, ok := strings.Cut(spec, ":")
+		if !ok || src == "" || dst == "" {
+			fmt.Fprintf(os.Stderr, "bad -preboot-file %q: want hostfile:dstpath\n", spec)
+			os.Exit(2)
+		}
+		must(installHostFile(prebootRoot, dst, src))
+		fmt.Fprintf(os.Stderr, "installed preboot file %s at %s\n", src, dst)
 	}
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
@@ -683,7 +828,21 @@ func main() {
 			// the boot *volume* UUID and reports that as the group UUID.
 			// Name the directory accordingly.
 			apfswrite.VolumeSpec{Name: "Preboot", Role: apfs.VolumeRolePreboot, Root: &apfswrite.Entry{Children: []*apfswrite.Entry{
-				dirEntry(uuidString(volUUID), dirEntry("boot"), dirEntry("cryptex1"), dirEntry("restore")),
+				dirEntry(uuidString(volUUID), prebootRoot.Children...),
+				// The system volume's /System/Cryptexes/{OS,App,Rosetta,
+				// ExclaveOS} entries are com.apple.fs.symlink links whose
+				// primary target is ../../System/Volumes/Preboot/Cryptexes/*
+				// and whose altlink is .../Cryptexes/Incoming/OS.  libignition
+				// opens the canonical root /System/Volumes/Preboot/Cryptexes/OS/
+				// during the cryptex1 graft; the Preboot volume must actually
+				// contain those directories or the graft aborts with ENOENT.
+				dirEntry("Cryptexes",
+					dirEntry("OS"),
+					dirEntry("App"),
+					dirEntry("Rosetta"),
+					dirEntry("ExclaveOS"),
+					dirEntry("Incoming", dirEntry("OS")),
+				),
 			}}},
 		)
 	}
@@ -738,6 +897,11 @@ func main() {
 	}
 
 	fmt.Fprintf(os.Stderr, "writing %s (%d bytes, %d volumes)...\n", *out, *size, len(specs))
+	var ms2 runtime.MemStats
+	runtime.ReadMemStats(&ms2)
+	fmt.Fprintf(os.Stderr, "[pre-write] heap=%dMB sys=%dMB\n",
+		ms2.HeapAlloc>>20, ms2.Sys>>20)
+	elapsed("starting container write")
 	err = apfswrite.CreateContainer(cw, *size, &apfswrite.CreateOptions{Volumes: specs})
 	if err != nil && strings.Contains(err.Error(), "sizing image") {
 		// All real blocks are already on disk; only the final length is missing.
@@ -746,6 +910,7 @@ func main() {
 		err = nil
 	}
 	must(err)
+	elapsed("container write complete")
 	if len(parts) > 0 {
 		// NTFS3 refuses far writes past EOF, so grow first (usually the
 		// container's final-byte write already did) and only then place

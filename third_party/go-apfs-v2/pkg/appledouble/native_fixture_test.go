@@ -1,0 +1,3 @@
+package appledouble
+
+const nativeLargeSHA256 = "cf9147dc250d8f01a14faf0bd40c5b2f4b09b2cf168d0ffcc265fc05399cd204"

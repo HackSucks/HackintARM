@@ -1,0 +1,63 @@
+go-apfs-v2
+Copyright (c) 2025-2026 deploymenttheory
+
+This product includes software design and code adapted from:
+
+1. go-apfs (https://github.com/blacktop/go-apfs)
+   Copyright (c) 2020-2026 blacktop
+   Licensed under the Apache License, Version 2.0.
+   The DMG/UDIF reader design (koly/blkx/mish parsing, chunk decompression,
+   LRU chunk caching), the ADC decompressor, the GPT parsing approach and
+   the multi-leaf B-tree record-walk algorithm in pkg/disk and pkg/apfs are
+   adapted from blacktop's implementation.
+
+2. The Apple File System Reference (Apple Inc.), used as the on-disk format
+   specification, including known errata identified by the community.
+
+3. go-apfs (https://github.com/blacktop/go-apfs)
+   Copyright (c) 2020-2026 blacktop
+   Licensed under the Apache License, Version 2.0.
+   The HFS+ catalog and on-disk type definitions in pkg/hfsplus are adapted
+   from blacktop's hfsplus package; file-data reading, extents overflow
+   support, link resolution and the io/fs adapter are original to this
+   project.
+
+4. apfsprogs / mkapfs (https://github.com/linux-apfs/apfsprogs)
+   Copyright (C) 2019 Ernesto A. Fernández
+   Licensed under the GNU General Public License, version 2.
+   The APFS file system writer in pkg/apfswrite began as a study of mkapfs and
+   used it as a reference and a springboard for understanding the format's
+   behaviour. It has since been reimplemented independently from the Apple
+   File System Reference — with its own structure, checkpoint-area sizing and
+   space manager layout — and shares none of mkapfs's source expression.
+   pkg/apfswrite is therefore original work, licensed MIT like the rest of
+   this repository. Where the on-disk container must match values that Apple's
+   APFS implementation validates on mount (for example the free-queue node
+   limits), those values are reproduced as functional interoperability
+   requirements of the format.
+
+5. LZFSE (https://github.com/lzfse/lzfse)
+   Copyright (c) 2015-2016, Apple Inc. All rights reserved.
+   Licensed under the BSD 3-Clause License; the licence text is in
+   pkg/compression/lzfse/LICENSE.
+   pkg/compression/lzfse is a Go port of Apple's reference LZFSE and LZVN
+   encoders and decoders. It follows the reference's algorithms and data
+   layout so that it writes the same bytes as macOS's libcompression, with
+   one change found by comparing against libcompression: the LZVN match
+   finder's hash. github.com/go-compressions/lzfse (BSD 3-Clause), which this
+   project used before, informed the Go structure; no code is taken from it.
+
+6. golang.org/x/sys/unix v0.48.0 (https://github.com/golang/sys)
+   Copyright 2018 The Go Authors. All rights reserved.
+   The static Darwin import/trampoline/runtime-call pattern in
+   internal/darwinabi and the test-only quarantine observer follows x/sys.
+   Licensed under the BSD 3-Clause License; see
+   internal/darwinabi/LICENSE.go-authors.
+
+7. Apple zlib (https://github.com/apple-oss-distributions/zlib)
+   Copyright (C) 1995-2022 Jean-loup Gailly and Mark Adler.
+   internal/decmpfs/encode_zlib.go is an altered Go implementation of the
+   deflate_slow and trees algorithms at revision
+   06673bf7cb4066003fd14a0b87085c05739fc4ac, qualified against the complete
+   pinned C sources and macOS libcompression. Licensed under the zlib
+   License; see internal/decmpfs/ZLIB_LICENSE.

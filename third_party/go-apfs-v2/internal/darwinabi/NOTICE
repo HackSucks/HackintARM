@@ -1,0 +1,5 @@
+The static import, trampoline and Go runtime call patterns in this directory
+are adapted from golang.org/x/sys/unix v0.48.0.
+Copyright 2018 The Go Authors. All rights reserved.
+See LICENSE.go-authors for the BSD license.
+The typed API inventory and generator are maintained by this project.

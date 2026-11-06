@@ -4,6 +4,13 @@ go 1.27.2
 
 require github.com/deploymenttheory/go-apfs-v2 v0.0.0-20261009134034-2bd8a20b6bd2
 
+// Local fork: apfswrite sizes the checkpoint areas for the single static
+// checkpoint it writes, which a mounted writable container exhausts
+// (tx_checkpoint_space_check: checkpoint area out of space). The fork reserves
+// Apple-like descriptor/data areas; see pkg/apfswrite/writer.go and
+// docs/isc-and-checkpoints.md.
+replace github.com/deploymenttheory/go-apfs-v2 => ../../third_party/go-apfs-v2
+
 require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/ulikunitz/xz v0.5.17 // indirect
