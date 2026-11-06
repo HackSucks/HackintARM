@@ -835,6 +835,210 @@ static int patch_apple_image4_ignition_sysctl(u8 *img, u64 span)
 	return 1;
 }
 
+/*
+ * Boot probes for the display swap path.
+ *
+ * The guest has a paravirtual display but never presents a frame.  The first
+ * question is whether WindowServer submits a swap at all, and if so how far
+ * the guest's IOMobileFramebuffer/AppleParavirtDisplay path gets before it
+ * stops.  Each site below is a prologue `mov` whose only effect is a register
+ * copy; replacing it with `hvc #0x4d0N` traps to Gatehouse (lib.c emulates
+ * the copy and resumes).  A probe changes nothing observable to the guest and
+ * can be removed once the path is understood.
+ */
+static int patch_probe(u8 *img, u64 span, const char *name,
+		       const u32 *pat, u32 n, u32 target_off, u32 expected,
+		       u32 imm)
+{
+	u64 off = find_pattern(img, span, pat, n);
+	u64 at;
+
+	if (off == (u64)-1) {
+		gh_uart_puts("probe: ");
+		gh_uart_puts(name);
+		gh_uart_puts(" pattern not found\n");
+		return 0;
+	}
+	at = off + target_off;
+	if (at + 4 > span) {
+		gh_uart_puts("probe: ");
+		gh_uart_puts(name);
+		gh_uart_puts(" outside image\n");
+		return 0;
+	}
+	if (rd32(img + at) != expected) {
+		gh_uart_puts("probe: ");
+		gh_uart_puts(name);
+		gh_uart_puts(" unexpected instruction, left alone\n");
+		return 0;
+	}
+	wr32(img + at, 0xd4000002u | ((imm & 0xffffu) << 5));
+	gh_uart_puts("probe: ");
+	gh_uart_puts(name);
+	gh_uart_puts(" armed\n");
+	return 1;
+}
+
+static int patch_swap_probes(u8 *img, u64 span)
+{
+	/* IOMobileFramebufferLegacy::swap_submit */
+	static const u32 swap_submit[] = {
+	    0xd503245fu, 0xd503237fu, 0xd10303ffu, 0xa9066ffcu,
+	    0xa90767fau, 0xa9085ff8u, 0xa90957f6u, 0xa90a4ff4u,
+	    0xa90b7bfdu, 0x9102c3fdu, 0xaa0103f6u, 0xaa0003f5u,
+	};
+	/* IOMobileFramebufferLegacy::swap_queue */
+	static const u32 swap_queue[] = {
+	    0xd503245fu, 0xd503237fu, 0xd10543ffu, 0xa90f6ffcu,
+	    0xa91067fau, 0xa9115ff8u, 0xa91257f6u, 0xa9134ff4u,
+	    0xa9147bfdu, 0x910503fdu, 0xaa0103f4u, 0xaa0003f3u,
+	    0xb0ff49c8u,
+	};
+	/* AppleParavirtDisplay::swap_begin_gated */
+	static const u32 swap_begin[] = {
+	    0xd503245fu, 0xd503237fu, 0xa9be4ff4u, 0xa9017bfdu,
+	    0x910043fdu, 0xaa0003f3u, 0xf9561400u, 0xf9400010u,
+	};
+	/* IOMobileFramebufferLegacy::swap_complete_gated */
+	static const u32 swap_complete[] = {
+	    0xd503245fu, 0xd503237fu, 0xd10303ffu, 0xa9066ffcu,
+	    0xa90767fau, 0xa9085ff8u, 0xa90957f6u, 0xa90a4ff4u,
+	    0xa90b7bfdu, 0x9102c3fdu, 0xaa0103f6u, 0xaa0003f3u,
+	    0xb0ff49e8u,
+	};
+	/* IOMobileFramebufferUserClient::swap_start */
+	static const u32 uc_swap_start[] = {
+	    0xd503245fu, 0xd503237fu, 0xa9be4ff4u, 0xa9017bfdu,
+	    0x910043fdu, 0xaa0103f4u, 0xaa0003f3u, 0xb940f008u,
+	};
+	/* IOMobileFramebufferUserClient::swap_submit */
+	static const u32 uc_swap_submit[] = {
+	    0xd503245fu, 0xd503237fu, 0xd10103ffu, 0xa90157f6u,
+	    0xa9024ff4u, 0xa9037bfdu, 0x9100c3fdu, 0xaa0103f3u,
+	    0xaa0003f4u, 0x711b805fu,
+	};
+	/* IOMobileFramebufferLegacy::note_vbl_ISR */
+	static const u32 note_vbl[] = {
+	    0xd503245fu, 0xd503237fu, 0xd10103ffu, 0xa90157f6u,
+	    0xa9024ff4u, 0xa9037bfdu, 0x9100c3fdu, 0xaa0103f5u,
+	    0xaa0003f3u, 0xf9400010u, 0xaa0003f1u, 0xf2f9b431u,
+	};
+	/* IOMobileFramebufferLegacy::swapping_client_did_start */
+	static const u32 swapping_did_start[] = {
+	    0xd503245fu, 0xd503237fu, 0xa9be4ff4u, 0xa9017bfdu,
+	    0x910043fdu, 0xaa0003f3u, 0xf94ea000u, 0x94003b96u,
+	    0x52838708u, 0x8b080260u, 0x94003bcfu, 0x35000720u,
+	};
+	/* IOMobileFramebufferLegacy::swap_start */
+	static const u32 iomfb_swap_start[] = {
+	    0xd503245fu, 0xd503237fu, 0xa9be4ff4u, 0xa9017bfdu,
+	    0x910043fdu, 0xaa0103f3u, 0xaa0003f4u, 0xaa0203e0u,
+	    0x97ffd879u, 0xb40003a0u, 0xaa0003e3u, 0xf94da680u,
+	};
+	/* IOMobileFramebufferUserClient::externalMethod */
+	static const u32 uc_external_method[] = {
+	    0xd503245fu, 0xd503237fu, 0xa9bd57f6u, 0xa9014ff4u,
+	    0xa9027bfdu, 0x910083fdu, 0xaa0203f4u, 0xaa0103f5u,
+	    0xaa0003f3u, 0xf9406c00u, 0xf9400010u, 0xaa0003f1u,
+	    0xf2f9b431u, 0xdac11a30u, 0xd2812011u, 0x8b110210u,
+	};
+	/* AppleParavirtDisplay::start_hardware block_invoke (lambda 0) */
+	static const u32 pvg_start_hw_block[] = {
+	    0xd503245fu, 0xd503237fu, 0xd10143ffu, 0xa9034ff4u,
+	    0xa9047bfdu, 0x910103fdu, 0xaa0003f4u, 0xf9401413u,
+	    0xaa1303e0u, 0x97ffec3cu, 0x34000120u, 0x52838188u,
+	};
+	/* AppleParavirtDisplay::program_hardware_swap_gated */
+	static const u32 program_hw_swap[] = {
+	    0xd503245fu, 0xd503237fu, 0xd10243ffu, 0x6d0223e9u,
+	    0xa9036ffcu, 0xa90467fau, 0xa9055ff8u, 0xa90657f6u,
+	    0xa9074ff4u, 0xa9087bfdu, 0x910203fdu, 0xb4005581u,
+	    0xaa0103f4u, 0xaa0003f3u,
+	};
+	int applied = 0;
+
+	applied += patch_probe(img, span, "swap_submit", swap_submit,
+			       (u32)(sizeof(swap_submit) / 4), 0x28,
+			       0xaa0103f6u, 0x4d01u);
+	applied += patch_probe(img, span, "swap_queue", swap_queue,
+			       (u32)(sizeof(swap_queue) / 4), 0x2c,
+			       0xaa0003f3u, 0x4d02u);
+	applied += patch_probe(img, span, "swap_begin_gated", swap_begin,
+			       (u32)(sizeof(swap_begin) / 4), 0x14,
+			       0xaa0003f3u, 0x4d03u);
+	applied += patch_probe(img, span, "swap_complete_gated", swap_complete,
+			       (u32)(sizeof(swap_complete) / 4), 0x2c,
+			       0xaa0003f3u, 0x4d04u);
+	applied += patch_probe(img, span, "program_hardware_swap_gated",
+			       program_hw_swap,
+			       (u32)(sizeof(program_hw_swap) / 4), 0x34,
+			       0xaa0003f3u, 0x4d05u);
+	applied += patch_probe(img, span, "uc_swap_start", uc_swap_start,
+			       (u32)(sizeof(uc_swap_start) / 4), 0x18,
+			       0xaa0003f3u, 0x4d06u);
+	applied += patch_probe(img, span, "uc_swap_submit", uc_swap_submit,
+			       (u32)(sizeof(uc_swap_submit) / 4), 0x20,
+			       0xaa0003f4u, 0x4d07u);
+	applied += patch_probe(img, span, "note_vbl_ISR", note_vbl,
+			       (u32)(sizeof(note_vbl) / 4), 0x1c,
+			       0xaa0103f5u, 0x4d08u);
+	applied += patch_probe(img, span, "swapping_client_did_start",
+			       swapping_did_start,
+			       (u32)(sizeof(swapping_did_start) / 4), 0x14,
+			       0xaa0003f3u, 0x4d09u);
+	applied += patch_probe(img, span, "iomfb_swap_start", iomfb_swap_start,
+			       (u32)(sizeof(iomfb_swap_start) / 4), 0x14,
+			       0xaa0103f3u, 0x4d0au);
+	applied += patch_probe(img, span, "uc_externalMethod",
+			       uc_external_method,
+			       (u32)(sizeof(uc_external_method) / 4), 0x18,
+			       0xaa0203f4u, 0x4d0bu);
+	applied += patch_probe(img, span, "pvg_start_hw_block",
+			       pvg_start_hw_block,
+			       (u32)(sizeof(pvg_start_hw_block) / 4), 0x18,
+			       0xaa0003f4u, 0x4d0cu);
+
+	return applied;
+}
+
+/* Decode a B.cond target; (u64)-1 when `insn` is not a B.cond. */
+static u64 bcond_target(u32 insn, u64 pc)
+{
+	i64 imm;
+
+	if ((insn & 0xff000010u) != 0x54000000u) {
+		return (u64)-1;
+	}
+	imm = (i64)((insn >> 5) & 0x3ffffu);
+	if (imm & (1 << 18)) {
+		imm -= (1 << 19);
+	}
+	return pc + (u64)(imm << 2);
+}
+
+/* Encode "b <target>" at `pc`; 0 when out of range or unaligned. */
+static u32 encode_b(u64 pc, u64 target)
+{
+	i64 off = (i64)(target - pc);
+
+	if ((off & 3) != 0 || off < -(1 << 27) || off >= (1 << 27)) {
+		return 0;
+	}
+	return 0x14000000u | ((u32)(off >> 2) & 0x03ffffffu);
+}
+
+/* Encode "b.<cond> <target>" at `pc`; 0 when out of range or unaligned. */
+static u32 encode_bcond(u32 cond, u64 pc, u64 target)
+{
+	i64 off = (i64)(target - pc);
+
+	if ((off & 3) != 0 || off < -(1 << 20) || off >= (1 << 20)) {
+		return 0;
+	}
+	return 0x54000000u | (((u32)(off >> 2) & 0x7ffffu) << 5) |
+	    (cond & 0xfu);
+}
+
 int gh_patch_kernel(u8 *img, u64 span, const gh_macho *m)
 {
 	int applied = 0;
@@ -850,6 +1054,9 @@ int gh_patch_kernel(u8 *img, u64 span, const gh_macho *m)
 
 	/* Root-volume authentication with no host attestation (see above). */
 	applied += patch_apple_root_auth(img, span, m);
+
+	/* Display swap-path probes (diagnostic, see above). */
+	applied += patch_swap_probes(img, span);
 
 	return applied;
 }

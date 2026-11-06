@@ -143,6 +143,11 @@ The launcher builds Gatehouse, regenerates the ADT, stages an EFI System
 Partition in `build/esp`, and starts QEMU with AAVMF, GICv3 and a GDB stub on
 `:1234` (opt-in with `GDB=1`).
 
+When `/mnt/windows2/combined2.qcow2` exists, the launcher uses it as the
+read-write root disk by default. It is an overlay over `combined2.img`, which
+keeps guest writes out of the base disk. `ROOTIMG`, `ROOTFMT` and `ROOTIMG_RO`
+can select another image or access mode.
+
 The QEMU `virt` machine is a development vehicle, not the destination. Once
 Lantern and the remaining devices work there, only the machine description and
 the GPU backend should change for bare metal.
@@ -151,8 +156,10 @@ the GPU backend should change for bare metal.
 
 ## Disk tooling
 
-The root volume must be a raw, decrypted APFS block image. Nothing in the boot
-path retains AEA or an IPSW.
+The decrypted APFS volume is the input to disk assembly. The guest boots from
+the resulting GPT disk, which carries the iSC partition and the APFS System,
+Data and Preboot volumes; `qemu/run.sh` prefers its writable qcow2 overlay
+when present. Nothing in the boot path retains AEA or an IPSW.
 
 | Tool | Purpose |
 |---|---|

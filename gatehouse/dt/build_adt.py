@@ -127,9 +127,9 @@ GICR_PHYS = 0x080A0000
 #
 # The reference platform's tree follows the same rule (32 cpus * 0x20000 =
 # 0x400000), and so does QEMU, whose own region covers its 123 possible vCPUs
-# (0xF60000).  We describe exactly the CPUs we publish -- cpus=1 in the boot
-# arguments below -- so this is one frame.
-GICR_SIZE = 0x20000
+# (0xF60000).  We describe exactly the CPUs we publish -- the `cpus=N` boot
+# argument below is the --cpus count -- so the region is N frames.
+GICR_FRAME = 0x20000
 
 # The rest of QEMU virt's device window, from the machine's own DTB
 # (-M virt,dumpdtb=...).  The authentic VMApple platform carries the same two
@@ -606,7 +606,10 @@ def nvram_proxy_data(size=NVRAM_SIZE):
 # between Gatehouse and XNU, and the only thing that has to change to move to a
 # different machine.
 # ---------------------------------------------------------------------------
-def build(lantern=False, gsrp="syscfg"):
+def build(lantern=False, gsrp="syscfg", cpus=1):
+    if cpus < 1:
+        raise SystemExit("cpus must be at least 1")
+
     # ---------------------------------------------------------------------
     # /arm-io: the SoC's device window.
     # ---------------------------------------------------------------------
@@ -643,7 +646,7 @@ def build(lantern=False, gsrp="syscfg"):
         ("device_type", s("interrupt-controller")),
         ("AAPL,phandle", u32(PHANDLE_GIC)),
         ("reg", u64(GICD_PHYS - SOC_BASE, GICD_SIZE,
-                    GICR_PHYS - SOC_BASE, GICR_SIZE)),
+                    GICR_PHYS - SOC_BASE, GICR_FRAME * cpus)),
     )
 
     # The RTC.  QEMU virt has a real PL031; the authentic AVP carries both
@@ -804,38 +807,45 @@ def build(lantern=False, gsrp="syscfg"):
     # this machine actually runs.  The authentic AVP declares 24 MHz for all
     # six; only the *value* is machine-specific, and QEMU's counter is 1 GHz.
     # ---------------------------------------------------------------------
-    cpu0 = node(
-        "cpu0",
-        ("state", s("running")),                # only "running" cpus are read
-        ("compatible", s("ARM,v8")),
-        ("interrupt-parent", u32(PHANDLE_GIC)),
-        ("interrupts", u32(0x1, 0x1, 0x17, 0x1, 0x1, 0x1)),
-        ("cpu-id", u32(0)),
-        # reg is the *physical* cpu id (MPIDR_EL1 AFF1:AFF0); XNU requires it
-        # (ml_parse_cpu_topology: ML_READPROP_MANDATORY) and later matches it
-        # against "MRS MPIDR_EL1 & (MPIDR_AFF1_MASK|MPIDR_AFF0_MASK)", so it
-        # must be the masked value the architected timer/cpu-local code sees,
-        # not QEMU's raw register (which carries the RES1 bit 31).
-        ("reg", u32(0)),
-        ("device_type", s("cpu")),
-        ("AAPL,phandle", u32(PHANDLE_CPU0)),
-        ("timebase-frequency", u64(TIMEBASE_HZ)),
-        ("clock-frequency", u64(TIMEBASE_HZ)),
-        ("memory-frequency", u64(TIMEBASE_HZ)),
-        ("peripheral-frequency", u64(TIMEBASE_HZ)),
-        ("fixed-frequency", u64(TIMEBASE_HZ)),
-        ("bus-frequency", u64(TIMEBASE_HZ)),
-        ("cpu-version", u32(0)),
-        # An empty property: XNU reads its presence, not its value.
-        ("function-enable_core", b""),
-    )
+    # One node per CPU.  reg is the *physical* cpu id (MPIDR_EL1 AFF1:AFF0);
+    # XNU requires it (ml_parse_cpu_topology: ML_READPROP_MANDATORY) and later
+    # matches it against "MRS MPIDR_EL1 & (MPIDR_AFF1_MASK|MPIDR_AFF0_MASK)",
+    # so it must be the masked value the architected timer/cpu-local code sees,
+    # not QEMU's raw register (which carries the RES1 bit 31).  On QEMU virt
+    # cpu i has MPIDR affinity 0:i, so reg is the index; a machine whose CPU
+    # ids are not 0..N-1 publishes the real ids here instead.  The phandle is
+    # only for the tree's own consistency -- nothing resolves a CPU by phandle
+    # -- and the count is chosen once, by the caller, so the boot-arg below and
+    # the GICR region size stay in step with it.
+    cpu_nodes = []
+    for i in range(cpus):
+        cpu_nodes.append(node(
+            "cpu%d" % i,
+            ("state", s("running")),            # only "running" cpus are read
+            ("compatible", s("ARM,v8")),
+            ("interrupt-parent", u32(PHANDLE_GIC)),
+            ("interrupts", u32(0x1, 0x1, 0x17, 0x1, 0x1, 0x1)),
+            ("cpu-id", u32(i)),
+            ("reg", u32(i)),
+            ("device_type", s("cpu")),
+            ("AAPL,phandle", u32(PHANDLE_CPU0 + i)),
+            ("timebase-frequency", u64(TIMEBASE_HZ)),
+            ("clock-frequency", u64(TIMEBASE_HZ)),
+            ("memory-frequency", u64(TIMEBASE_HZ)),
+            ("peripheral-frequency", u64(TIMEBASE_HZ)),
+            ("fixed-frequency", u64(TIMEBASE_HZ)),
+            ("bus-frequency", u64(TIMEBASE_HZ)),
+            ("cpu-version", u32(0)),
+            # An empty property: XNU reads its presence, not its value.
+            ("function-enable_core", b""),
+        ))
 
-    cpus = node(
+    cpus_node = node(
         "cpus",
         ("#address-cells", u32(1)),
         ("#size-cells", u32(0)),
         ("AAPL,phandle", u32(PHANDLE_CPUS)),
-        children=[cpu0],
+        children=cpu_nodes,
     )
 
     # ---------------------------------------------------------------------
@@ -917,8 +927,11 @@ def build(lantern=False, gsrp="syscfg"):
     chosen = node(
         "chosen",
         ("AAPL,phandle", u32(PHANDLE_CHOSEN)),
-        # Gatehouse overrides this with GH_CMD_LINE; keep the two in step.
-        ("boot-args", s("debug=0x14e -v -noprogress serial=3 cpus=1 kextlog=0xfff keepsyms=1 exe_boothash_salt=0")),
+        # Gatehouse overrides this with GH_CMD_LINE; keep the two in step --
+        # including cpus=N, which Gatehouse derives from this same tree's
+        # /cpus child count (see gh_adt_count_children() in src/adt.c).
+        ("boot-args", s("debug=0x14e -v -noprogress serial=3 cpus=%d "
+                        "kextlog=0xfff keepsyms=1 exe_boothash_salt=0" % cpus)),
         # IOKitBSDInit() (IOKit/IOKitBSDInit.cpp) reads this to find the root
         # media: it takes the UUID string here (at most 37 bytes) and waits for
         # an IOMedia whose UUID matches it to publish the "boot-uuid-media"
@@ -1205,7 +1218,7 @@ def build(lantern=False, gsrp="syscfg"):
          + s("VirtualMac2,1")),
         ("#address-cells", u32(2)),
         ("#size-cells", u32(2)),
-        children=[chosen, defaults, product, options, arm_io, cpus, pram,
+        children=[chosen, defaults, product, options, arm_io, cpus_node, pram,
                   aliases, machine_timeouts, memory, vram, filesystems_props,
                   buttons, port_virtual_1, osenvironments, pmgr],
     )
@@ -1222,9 +1235,14 @@ def main():
                     default=os.environ.get("LANTERN_GSRP", "syscfg"),
                     help="gpu-sysmem-reserve-percent: 'syscfg' (authentic "
                          "unresolved string, default), 'omit', or a number")
+    ap.add_argument("--cpus", type=int,
+                    default=int(os.environ.get("ADT_CPUS", "1")),
+                    help="number of CPUs to publish: one /cpus child each, "
+                         "a GICR region of that many frames, and cpus=N in "
+                         "the command line (default 1)")
     args = ap.parse_args()
 
-    root = build(lantern=args.lantern, gsrp=args.gsrp)
+    root = build(lantern=args.lantern, gsrp=args.gsrp, cpus=args.cpus)
     blob = emit(root)
 
     out = args.output

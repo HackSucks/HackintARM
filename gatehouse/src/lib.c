@@ -141,9 +141,74 @@ void gh_el2_unexpected_c(u64 esr, u64 far, u64 elr, u64 spsr, u64 cel, u64 hcr)
  * Note: for HVC/SMC the architectural preferred return address is already the
  * instruction *after* the trap, so ELR_EL2 is returned unchanged.
  */
+#define ESR_EC_WFI_WFE	0x01u
 #define ESR_EC_HVC64	0x16u
 #define ESR_EC_SMC64	0x17u
 #define ESR_EC_DABT_LOW	0x24u
+
+/*
+ * Boot probes.  patch.c replaces one register-copy instruction in a chosen
+ * function with `hvc #0x4d0N`; the HVC lands here, which logs the site and
+ * emulates the instruction it displaced before resuming at the next one.  The
+ * probe exists so one boot can answer "did this path run?" without a debugger
+ * or a behaviour change in the guest.
+ */
+#define GH_PROBE_MAGIC	0x4d00u
+
+static void gh_probe_hit(u32 id, u64 pc, u64 *regs)
+{
+	static u32 hits[16];
+	u32 n;
+
+	if (id >= 16) {
+		return;
+	}
+	n = ++hits[id];
+	if (n <= 24) {
+		gh_uart_puts("probe ");
+		gh_uart_putdec(id);
+		gh_uart_puts(" at ");
+		gh_uart_puthex(pc);
+		gh_uart_puts(" n=");
+		gh_uart_putdec(n);
+		gh_uart_puts(" x0=");
+		gh_uart_puthex(regs[0]);
+		gh_uart_puts(" x1=");
+		gh_uart_puthex(regs[1]);
+		gh_uart_puts(" x2=");
+		gh_uart_puthex(regs[2]);
+		gh_uart_puts(" x3=");
+		gh_uart_puthex(regs[3]);
+		gh_uart_putc('\n');
+	}
+
+	switch (id) {
+	case 1:				/* swap_submit: mov x22, x1 */
+		regs[22] = regs[1];
+		break;
+	case 2:				/* swap_queue: mov x19, x0 */
+	case 3:				/* swap_begin_gated: mov x19, x0 */
+	case 4:				/* swap_complete_gated: mov x19, x0 */
+	case 5:				/* program_hardware_swap_gated: mov x19, x0 */
+	case 6:				/* userclient swap_start: mov x19, x0 */
+	case 9:				/* swapping_client_did_start: mov x19, x0 */
+		regs[19] = regs[0];
+		break;
+	case 7:				/* userclient swap_submit: mov x20, x0 */
+	case 12:			/* PVG start_hardware block: mov x20, x0 */
+		regs[20] = regs[0];
+		break;
+	case 11:			/* userclient externalMethod: mov x20, x2 */
+		regs[20] = regs[2];
+		break;
+	case 8:				/* note_vbl_ISR: mov x21, x1 */
+		regs[21] = regs[1];
+		break;
+	case 10:			/* IOMFB swap_start: mov x19, x1 */
+		regs[19] = regs[1];
+		break;
+	}
+}
 
 #define GH_PSCI_ID_MASK	0xbfffffffu
 
@@ -188,9 +253,42 @@ u64 gh_el2_trap_c(u64 esr, u64 far, u64 hpfar, u64 elr, u64 *regs)
 {
 	u32 ec = (u32)(esr >> 26) & 0x3fu;
 
+	if (ec == ESR_EC_HVC64) {
+		u32 imm = (u32)(esr & 0xffffu);
+
+		if ((imm & 0xff00u) == GH_PROBE_MAGIC) {
+			gh_probe_hit(imm & 0xffu, elr - 4, regs);
+			/* HVC's preferred return address is the next insn. */
+			return elr;
+		}
+	}
+
+	/*
+	 * With HCR_EL2.TWI set, an EL1 WFI lands here.  The host raises
+	 * Lantern interrupts by setting bits in shared RAM, and those bits
+	 * only become GIC SPIs when this layer runs.  Without polling here a
+	 * sleeping guest would not see them until some unrelated trap or the
+	 * next timer tick, which is exactly the stall the GPU/display stack
+	 * shows under TCG.  ELR_EL2 points at the WFI itself, so skip it and
+	 * let the guest's idle loop come straight back for the next poll.
+	 */
+	if (ec == ESR_EC_WFI_WFE) {
+		static int logged;
+
+		if (!logged) {
+			logged = 1;
+			gh_uart_puts("wfi: trapping guest WFI, polling Lantern IRQs\n");
+		}
+		gh_lantern_deliver_irqs();
+		return elr + 4;
+	}
+
 	if (ec == ESR_EC_HVC64 || ec == ESR_EC_SMC64) {
 		u64 fn = regs[0];
 		i64 ret;
+
+		/* A PSCI call is also a chance to hand over pending IRQs. */
+		gh_lantern_deliver_irqs();
 
 		if ((fn >> 24) == 0x84u || (fn >> 24) == 0xc4u)
 			ret = gh_psci((u32)fn, regs[1]);
@@ -223,9 +321,7 @@ u64 gh_el2_trap_c(u64 esr, u64 far, u64 hpfar, u64 elr, u64 *regs)
 		 * map, not a device access: report it rather than returning
 		 * a plausible-looking zero.
 		 */
-		if ((iss & (1u << 24)) &&
-		    ipa >= GH_LANTERN_GFX_BASE &&
-		    ipa < GH_LANTERN_IOSFC_BASE + GH_LANTERN_WINDOW_SIZE) {
+		if ((iss & (1u << 24)) && gh_lantern_owns(ipa)) {
 			if (is_write) {
 				u64 value = (srt == 31) ? 0 : regs[srt];
 
@@ -246,6 +342,7 @@ u64 gh_el2_trap_c(u64 esr, u64 far, u64 hpfar, u64 elr, u64 *regs)
 				if (srt != 31)
 					regs[srt] = value;
 			}
+			gh_lantern_deliver_irqs();
 			return elr + 4;
 		}
 

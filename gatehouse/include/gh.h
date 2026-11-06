@@ -82,10 +82,28 @@ void gh_stage2_init(void);
 #define GH_LANTERN_IRQ_GFX      0x31u
 
 /* lantern.c */
+/* The device windows, interrupt ids and GIC distributor address.  Gatehouse
+ * takes them from the ADT when it describes Lantern and falls back to the
+ * bring-up machine otherwise, so stage 2 and interrupt delivery follow the
+ * machine description instead of a second set of constants. */
+void gh_lantern_set_window(u32 which, u64 phys, u64 size);
+u64  gh_lantern_window_base(u32 which);
+u64  gh_lantern_window_size(u32 which);
+void gh_lantern_set_irq(u32 which, u32 id);
+u32  gh_lantern_irq(u32 which);
+void gh_lantern_set_gicd(u64 phys);
+u64  gh_gicd_base(void);
+int  gh_lantern_owns(u64 ipa);
+int  gh_lantern_configure_adt(const u8 *dt, u64 size);
+#define GH_LANTERN_GFX          0u
+#define GH_LANTERN_IOSFC        1u
+
 /* pc is the guest's ELR_EL2 for the trapped access, kept for the trace so a
  * register access can be traced back to the kernel function that made it. */
 u64  gh_lantern_mmio_read(u64 ipa, u32 size, u64 pc);
 void gh_lantern_mmio_write(u64 ipa, u32 size, u64 value, u64 pc);
+int gh_lantern_mailbox_init(u64 phys);
+void gh_lantern_deliver_irqs(void);
 
 /* macho.c */
 #define GH_MAX_SEGS 32
@@ -186,6 +204,10 @@ int gh_adt_set_property(u8 *dt, u64 cap, const char *path, const char *name,
 /* Read a property's value and length.  The pointer is into `dt`. */
 int gh_adt_get_property(const u8 *dt, u64 size, const char *path,
     const char *name, const u8 **value, u32 *len);
+
+/* How many children the node at `path` has, or -1 on a path/tree error.  Used
+ * to derive `cpus=N` from the tree's own /cpus count. */
+int gh_adt_count_children(const u8 *dt, u64 size, const char *path);
 
 /* jump.S */
 void gh_jump_to_kernel(u64 entry, u64 bootargs_pa, u64 stack_top,

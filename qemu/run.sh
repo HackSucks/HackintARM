@@ -31,7 +31,29 @@ MEM="${MEM:-3G}"
 # it were enabled instead, tempt XNU into streaming-mode code paths that
 # cannot work on the target.  Match the target here rather than teaching the
 # guest about features it will never see.
-CPU="${CPU:-max,sve=off,sme=off}"
+#
+# pauth-impdef=on: QEMU's `max` implements the PAC instructions with a real
+# keyed hash -- many host instructions per guest instruction -- which is a
+# large part of why a TCG boot of arm64e userland is slow.  IMPDEF uses the
+# architecture's cheap, implementation-defined algorithm instead.  This is
+# sound here because XNU and every process only ever sign and authenticate
+# their own pointers, all under keys they set themselves: any consistent
+# implementation gives the same accept/reject answers.  It is a bring-up speed
+# knob only -- real hardware runs the native instructions, so this is not
+# something the target needs or the ADT describes.
+CPU="${CPU:-max,sve=off,sme=off,pauth-impdef=on}"
+# Guest CPUs.  One by default: guest secondary bring-up runs through the
+# platform PMGR/PSCI path, which is not complete yet, so publishing more CPUs
+# than the machine can actually start would only stall the boot.  When that
+# path lands, one number drives both QEMU's -smp and the tree's /cpus count
+# (build_adt.py --cpus), which is also what Gatehouse reads back for cpus=N.
+# The T8103 target has MAX_CPUS 8, so 8 is the natural upper bound.
+CPUS="${CPUS:-1}"
+# Translation cache, in MiB.  XNU's boot touches a lot of distinct code and the
+# stock 32 MiB TB fills and flushes repeatedly under TCG; a larger one trades
+# host RAM for far fewer translation flushes.  Guest RAM (MEM, 3G by default)
+# plus this has to fit, so lower it if the host is tight.
+TB_SIZE="${TB_SIZE:-1024}"
 GDB_PORT="${GDB_PORT:-1234}"
 # The GDB stub is opt-in.  Runs launched with it (GDB=1) have repeatedly been
 # observed to park the vCPU thread under TCG -- guest PC somewhere in early
@@ -42,21 +64,23 @@ GDB_PORT="${GDB_PORT:-1234}"
 USE_GDB="${GDB:-0}"
 EXTRA=("$@")
 
-# The root volume, as a raw block device.  XNU's storage stack is
-# AppleVirtIOStorageDevice behind AppleVirtIOTransport, whose PCI transport
-# matches the *generic* virtio ids (AppleVirtIOBlock carries
-# IOVirtIOPrimaryMatch = 0x00021af4 = virtio type 2, vendor 0x1af4), so a
-# plain virtio-blk-pci is the right device; what was missing was the guest
-# enumerating the bus at all, which is what /arm-io/pcie is for.  The image is
-# opened read-only by default: it is the only decrypted copy of the volume, and
-# a boot that writes to it would have to be redone from the IPSW.
-ROOTIMG="${ROOTIMG:-/mnt/windows2/vmapple-rootfs/043-70867-635.dmg}"
-ROOTIMG_RO="${ROOTIMG_RO:-1}"
-# Container format of ROOTIMG.  A qcow2 overlay over the pristine raw image is
-# the writable-root setup: the guest gets a read-write disk (which is what
-# userland expects -- it mounts Preboot and Data read-write), while every write
-# lands in the sparse overlay and the 18 GiB base image is never modified.
-ROOTFMT="${ROOTFMT:-raw}"
+# Root disk.  The assembled GPT image has the iSC and APFS partitions, with
+# System, Data and Preboot volumes in the APFS container.  Prefer its qcow2
+# overlay when present: the guest needs Preboot and Data writable, while the
+# base `.img` remains untouched.  The standalone decrypted `.dmg` is only a
+# fallback; it does not contain the full boot disk layout.
+if [[ -f /mnt/windows2/combined2.qcow2 ]]; then
+  ROOTIMG_DEFAULT=/mnt/windows2/combined2.qcow2
+  ROOTFMT_DEFAULT=qcow2
+  ROOTIMG_RO_DEFAULT=0
+else
+  ROOTIMG_DEFAULT=/mnt/windows2/vmapple-rootfs/043-70867-635.dmg
+  ROOTFMT_DEFAULT=raw
+  ROOTIMG_RO_DEFAULT=1
+fi
+ROOTIMG="${ROOTIMG:-$ROOTIMG_DEFAULT}"
+ROOTIMG_RO="${ROOTIMG_RO:-$ROOTIMG_RO_DEFAULT}"
+ROOTFMT="${ROOTFMT:-$ROOTFMT_DEFAULT}"
 
 # Auxiliary storage (the iSC container).  macOS 27's mount-phase-1 mounts
 # xART off a GPT partition whose type GUID is 69646961-6700-11AA-AA11-00306543ECAC
@@ -89,7 +113,12 @@ FW_CODE=/usr/share/edk2/aarch64/QEMU_EFI.fd
 FW_VARS=/usr/share/edk2/aarch64/QEMU_VARS.fd
 
 echo "== building gatehouse =="
-make -C "$GH" ${STALL:+STALL=$STALL} >/dev/null
+make -C "$GH" clean >/dev/null
+if [[ "${LANTERN:-0}" == "1" ]]; then
+  make -C "$GH" ${STALL:+STALL=$STALL} LANTERN=1 >/dev/null
+else
+  make -C "$GH" ${STALL:+STALL=$STALL} >/dev/null
+fi
 
 if [[ ! -f "$KERNEL" ]]; then
   echo "error: kernel image not found: $KERNEL" >&2
@@ -104,7 +133,7 @@ if [[ "${LANTERN:-0}" == "1" ]]; then
   # carries: syscfg (authentic unresolved string, default), omit, or a number.
   LANTERN_ARG="--lantern --gsrp ${LANTERN_GSRP:-syscfg}"
 fi
-python3 "$GH/dt/build_adt.py" -o "$ROOT/build/gatehouse.adt" $LANTERN_ARG
+python3 "$GH/dt/build_adt.py" -o "$ROOT/build/gatehouse.adt" --cpus "$CPUS" $LANTERN_ARG
 
 echo "== staging ESP =="
 rm -rf "$ESP"
@@ -156,11 +185,69 @@ if [[ -n "$RAMDISK" ]]; then
 fi
 ls -l "$ESP/EFI/BOOT/BOOTAA64.EFI" "$ESP/gatehouse/"
 
+# QEMU's directory-backed FAT drive creates its scratch image in /var/tmp,
+# which is read-only in some managed runners. Build an ordinary FAT image in
+# the workspace instead; Gatehouse only reads this ESP during boot.
+ESPIMG="$ROOT/build/esp.img"
+truncate -s 128M "$ESPIMG"
+mkfs.vfat -F 32 "$ESPIMG" >/dev/null
+mcopy -s -i "$ESPIMG" "$ESP/EFI" ::/EFI
+mcopy -s -i "$ESPIMG" "$ESP/gatehouse" ::/gatehouse
+
+# The machine's RAM.  Gatehouse discovers the real window from the firmware
+# memory map, so MEM is the only place a capacity is chosen and every value
+# here follows it.  The host adapter learns the window from the mailbox in
+# the guest's RAM, not from a hardcoded base.
+MACHINE="virt,gic-version=3,highmem-ecam=off,highmem=off"
+LANTERN_ARGS=()
+RAMFILE=""
+HOSTPID=""
+if [[ "${LANTERN:-0}" == "1" ]]; then
+  # The RAM file has to be on a filesystem that supports a writable MAP_SHARED
+  # mapping; NTFS/FUSE (this workspace's /mnt/newvol) refuses one, so the
+  # default is tmpfs.  Point LANTERN_RAMFILE at a real disk to keep a capture.
+  RAMFILE="${LANTERN_RAMFILE:-${TMPDIR:-/tmp}/lantern-ram-$$.bin}"
+  rm -f "$RAMFILE"
+  truncate -s "$MEM" "$RAMFILE"
+
+  MACHINE_EXTRA="${VIRT_EXTRA:-}"
+  if [[ ",$MACHINE_EXTRA," != *",virtualization=on,"* ]]; then
+    MACHINE_EXTRA="${MACHINE_EXTRA:+$MACHINE_EXTRA,}virtualization=on"
+  fi
+  MACHINE="$MACHINE,memory-backend=lantern_ram,$MACHINE_EXTRA"
+  LANTERN_ARGS=(-object "memory-backend-file,id=lantern_ram,size=$MEM,mem-path=$RAMFILE,share=on")
+
+  # The dist must be built for an ARM64 guest's 16 KiB pages even though it
+  # runs on this x86-64 host; see patches/reims-vgpu-arm64-guest-page-size.patch.
+  : "${REIMS_VGPU_PKG_CONFIG_PATH:=$ROOT/build/reims-dist-2/lib/pkgconfig}"
+  : "${PKG_CONFIG_PATH:=${REIMS_VGPU_PKG_CONFIG_PATH}}"
+  export PKG_CONFIG_PATH
+  make -C "$ROOT/lantern/host" >/dev/null
+  libdir="$(pkg-config --variable=libdir reims-vgpu)"
+  export LD_LIBRARY_PATH="$libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+  # The adapter takes the RAM file and finds the mailbox and its geometry by
+  # magic.  LANTERN_RAM_BASE is only a cross-check for a hand-run host.
+  LANTERN_HOST_ARGS=("$RAMFILE")
+  if [[ -n "${LANTERN_RAM_BASE:-}" ]]; then
+    LANTERN_HOST_ARGS+=("$LANTERN_RAM_BASE")
+  fi
+  "$ROOT/lantern/host/lantern-host" "${LANTERN_HOST_ARGS[@]}" &
+  HOSTPID=$!
+  trap 'kill "$HOSTPID" 2>/dev/null || true; wait "$HOSTPID" 2>/dev/null || true; rm -f "$RAMFILE"' EXIT
+fi
+
 # XNU's pe_fiq.c is a GICv3 driver: pe_init_fiq() maps /arm-io/gic's GICD and
 # walks the GICR redistributor frames.  QEMU's virt machine defaults to GICv2
 # under TCG, which has no redistributors at all (the read of GICR_TYPER lands
 # in an unmapped hole and takes a synchronous external abort), so pin GICv3.
 QARGS=(
+  # TCG tuning.  thread=multi is the modern default for aarch64-on-x86 and
+  # costs nothing at CPUS=1; tb-size overrides the stock 32 MiB translation
+  # cache.  Both only take effect under the TCG accelerator (there is no KVM
+  # for an aarch64 guest on this x86-64 host), and passing -accel explicitly
+  # keeps a run from silently picking a different one.
+  -accel "tcg,thread=multi,tb-size=$TB_SIZE"
   # highmem-ecam=off puts the ECAM at 0x3f000000 (16 MB, 16 buses) instead of
   # 0x4010000000.  That keeps the host bridge's "reg" inside /arm-io's SoC
   # window, which is what lets the guest resolve the node to IODeviceMemory at
@@ -182,11 +269,15 @@ QARGS=(
   # Gatehouse reads the firmware memory map on every boot and rewrites
   # /chosen dram-base and dram-size, /pram and the /arm-io window to match,
   # so MEM is the only place a capacity is chosen.
-  -M "virt,gic-version=3,highmem-ecam=off,highmem=off${VIRT_EXTRA:+,$VIRT_EXTRA}"
+  -M "$MACHINE"
   -cpu "$CPU"
   -m "$MEM"
+  # The vCPUs QEMU exposes must be at least the CPUs the tree publishes
+  # (build_adt.py --cpus), or XNU would try to start a core that does not
+  # exist; extras are harmless because they merely sit parked.
+  -smp "$CPUS"
   -bios "$FW_CODE"
-  -drive "if=none,id=hd0,format=raw,file=fat:rw:$ESP"
+  -drive "if=none,id=hd0,format=raw,file=$ESPIMG"
   # The AVP describes no I/O port window (its "ranges" carries only MMIO), and
   # QEMU's own vmapple machine force-disables legacy virtio for the same
   # reason (vmapple_compat_defaults sets virtio-pci.disable-legacy=on).  A
@@ -195,6 +286,11 @@ QARGS=(
   # the property.
   -device virtio-blk-pci,drive=hd0,disable-legacy=on
 )
+
+if [[ ${#LANTERN_ARGS[@]} -gt 0 ]]; then
+  QARGS+=("${LANTERN_ARGS[@]}")
+fi
+
 
 if [[ -n "$ROOTIMG" && -f "$ROOTIMG" ]]; then
   echo "== attaching root volume: $ROOTIMG (ro=$ROOTIMG_RO fmt=$ROOTFMT) =="
@@ -272,4 +368,4 @@ else
 fi
 
 echo "== launching QEMU (gdb=$USE_GDB port=$GDB_PORT) =="
-exec qemu-system-aarch64 "${QARGS[@]}" "${EXTRA[@]}"
+qemu-system-aarch64 "${QARGS[@]}" "${EXTRA[@]}"

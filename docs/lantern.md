@@ -126,10 +126,13 @@ what keeps the bare-metal port bounded.
 | Machine descriptions | `gatehouse/dt/build_adt.py`, `trestle/src/machines.c` | addresses and IRQs |
 | Build glue | `lantern/Makefile`, top-level docs | static library + pkg-config |
 
-Lantern runs **in-process** with its host: a static library linked into QEMU's
-device, and later into the Trestle bare-metal image. There is no daemon and no
-IPC on the boot path. Process isolation can be added on hosted systems later; it
-is not part of the design.
+The PVG consumer is independent of its transport. `lantern_host_consume()` takes
+a guest-memory map and a mailbox supplied by a platform adapter. The QEMU bring-up
+currently supplies those through shared file-backed RAM and a polling mailbox;
+a hardware host adapter must map the same mailbox and guest pages through its
+hypervisor or privileged host interface. That adapter is platform code; the PVG
+consumer, reims-vgpu integration, and mailbox ABI remain reusable. Shared-memory
+coherency and interrupt delivery are requirements of each adapter.
 
 ---
 
@@ -411,13 +414,14 @@ carry over to the real machine.
 - **The reims-vgpu core and its Vulkan backend** need an OS (Vulkan, files,
   windowing), which EL2 does not have. On the hosted bring-up they run in a
   host process.
-- **The only QEMU-side addition is a transport**: shared guest RAM
-  (`memory-backend-file,share=on`) plus a doorbell. It moves bytes and signals
-  and knows nothing about PVG; it is to Lantern what a shared-memory ring
-  between two hardware domains is.
-- **On hardware** the same backend moves into a privileged host domain
-  (EL1/EL0) or a freestanding GPU driver, behind the identical ring. Only the
-  transport changes.
+- **The QEMU adapter** maps guest RAM from `memory-backend-file,share=on`, finds
+  the reserved mailbox, and polls requests. It moves MMIO transactions and
+  interrupt bits; it does not parse PVG commands.
+- **A hardware adapter** supplies the same consumer with the machine's guest RAM
+  mappings and a coherent mailbox mapping. It may use a hypervisor mapping,
+  shared-memory page, and event notification appropriate to that host. This
+  adapter has not been implemented yet; the host consumer does not depend on the
+  QEMU file format or RAM base.
 
 ### Device windows
 
@@ -475,6 +479,11 @@ it goes straight to the display controller.
   (x86-64 or AArch64 Linux);
 - Trestle's EL2 front-end built into the Gatehouse boot image;
 - no QEMU patch series and no out-of-tree QEMU module.
+
+[`lantern/host/consumer.c`](../lantern/host/consumer.c) owns the reims-vgpu
+devices and consumes MMIO requests through a platform-supplied transport.
+[`lantern/host/shared_ram.c`](../lantern/host/shared_ram.c) is the current QEMU
+adapter; hardware can provide its own adapter without changing the consumer.
 
 ### What stays QEMU-specific
 
@@ -560,13 +569,17 @@ the device trace. No fault, no panic. The trace line format is
 **Done when:** the guest's interrupt handler reads `0x1018`, `0x1014` and
 `0x102c`, and the host sees FIFO doorbells.
 
-**Status (boot 4, 2026-11-04).** The trap path, the register file and
-interrupt delivery are proven. Pending SPI `0x31` on `FIFO_ENABLE` makes the
-guest run `setupInterruptsEarly`'s block and read `0x1018`, `0x1014` and
-`0x102c`; `writeFifo` then writes FIFO_WRITTEN and polls FIFO_READ, which the
-stub never advances. What remains of this phase is making the interrupt
-source real (host flag in shared RAM, not a one-shot probe) and letting the
-FIFO consumer complete the command so FIFO_READ moves.
+**Status (boot 4 and attached-disk boot, 2026-11-04).** The trap path, the
+register file and interrupt delivery are proven. With the assembled
+`combined2.qcow2` root disk attached, XNU reaches `Early boot complete` without
+a kernel panic; the paravirtual GPU and IOSurface drivers start. Pending SPI
+`0x31` on `FIFO_ENABLE` makes the guest run `setupInterruptsEarly`'s block and
+read `0x1018`, `0x1014` and `0x102c`. `writeFifo` then writes FIFO_WRITTEN and
+polls FIFO_READ, which stays at zero while the stub has no consumer. The
+remaining Phase 1 work is making the interrupt source real (host flag in
+shared RAM, not a one-shot probe) and servicing the root FIFO so FIFO_READ
+moves. The guest proceeds into launchd, but `loginwindow` still crash-loops
+until command processing and display support work.
 
 ### Phase 2 — FIFOs and memory
 

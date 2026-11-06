@@ -59,8 +59,14 @@ static EFI_BOOT_SERVICES *BS;
  * the only thing that ever feeds characters into the BSD console queue, and
  * XNU only exposes hw.serialdebugmode -- the sysctl launchd reads to decide
  * whether to load the serial console job -- when output *and* input are both
- * set (bsd/kern/kern_mib.c).  With serial=1 there is no way in at all. */
-#define GH_CMD_LINE         "debug=0x14e -v -noprogress serial=3 cpus=1 kextlog=0xfff keepsyms=1 exe_boothash_salt=0"
+ * set (bsd/kern/kern_mib.c).  With serial=1 there is no way in at all.
+ *
+ * cpus= is deliberately *not* here: the machine's CPU count is chosen once,
+ * in the device tree, and the command line carries it back out of that same
+ * tree (see the /cpus count below).  A compiled-in number could disagree with
+ * the tree the machine published, and ml_parse_cpu_topology() would then take
+ * the boot arg's word over the hardware. */
+#define GH_CMD_LINE         "debug=0x14e -v -noprogress serial=3 kextlog=0xfff keepsyms=1 exe_boothash_salt=0"
 
 /* ------------------------------------------------------------------ */
 
@@ -569,6 +575,9 @@ static int load_and_jump(void)
 	u64 tc_phys = 0, tc_len = 0;
 	const u8 *rd_payload = 0;
 	u64 rd_len = 0, rd_off = 0;
+#ifdef GH_LANTERN_HOST_TRANSPORT
+	u64 mb_off = 0;
+#endif
 	int init_arg = 0;
 
 	root = open_root();
@@ -632,6 +641,16 @@ static int load_and_jump(void)
 		rd_off = top_off;
 		top_off = (rd_off + rd_len + GH_PAGE - 1) & ~(GH_PAGE - 1);
 	}
+#ifdef GH_LANTERN_HOST_TRANSPORT
+	/*
+	 * Lantern's host mailbox rides at the end of the same reserved window.
+	 * That window is what boot_args calls topOfKernelData, so XNU maps it
+	 * but never gives it to the VM allocator: the page survives the boot
+	 * without carving a hole in the machine's DRAM window.
+	 */
+	mb_off = top_off;
+	top_off += GH_PAGE;
+#endif
 	/*
 	 * AllocatePages() counts 4 KiB pages whatever the CPU's translation
 	 * granule is, so the count must use GH_EFI_PAGE.  GH_PAGE stays in the
@@ -762,6 +781,10 @@ static int load_and_jump(void)
 		return -1;
 	}
 	gh_loghex("top of kernel   : ", top_of_kernel);
+#ifdef GH_LANTERN_HOST_TRANSPORT
+	if (gh_lantern_mailbox_init(img + mb_off) != 0)
+		return -1;
+#endif
 	if (rd_len) {
 		gh_memcpy((u8 *)img + rd_off, rd_payload, rd_len);
 		gh_loghex("ramdisk         : ", img + rd_off);
@@ -993,6 +1016,13 @@ static int load_and_jump(void)
 
 		gh_loghex("dram base       : ", dram[0]);
 		gh_loghex("dram size       : ", dram[1]);
+
+		/*
+		 * With the tree final, take Lantern's windows, interrupts and
+		 * GIC distributor from it.  Stage 2 runs after this and maps
+		 * exactly what the machine description says.
+		 */
+		gh_lantern_configure_adt((const u8 *)dt_phys, dtsize);
 	}
 
 	/* boot args */
@@ -1097,6 +1127,39 @@ static int load_and_jump(void)
 		for (ci = 0; GH_CMD_LINE[ci]; ci++) {
 			cmdline[cn++] = GH_CMD_LINE[ci];
 		}
+
+		/*
+		 * cpus=N, read back out of the tree's own /cpus count.  The
+		 * machine description is the one place the number is chosen,
+		 * so the boot arg and the hardware stay in step by
+		 * construction; ml_parse_cpu_topology() takes the first N
+		 * /cpus children.  A tree with no (or an unparseable) /cpus
+		 * stays single-CPU, which is what the bring-up machine ran
+		 * before the count was published.
+		 */
+		{
+			int ncpu = dtsize ?
+			    gh_adt_count_children((const u8 *)dt_phys, dtsize,
+			        "cpus") : -1;
+			char digits[4];
+			int nd = 0;
+
+			if (ncpu < 1)
+				ncpu = 1;
+			cmdline[cn++] = ' ';
+			cmdline[cn++] = 'c';
+			cmdline[cn++] = 'p';
+			cmdline[cn++] = 'u';
+			cmdline[cn++] = 's';
+			cmdline[cn++] = '=';
+			do {
+				digits[nd++] = (char)('0' + ncpu % 10);
+				ncpu /= 10;
+			} while (ncpu && nd < (int)sizeof(digits));
+			while (nd > 0)
+				cmdline[cn++] = digits[--nd];
+		}
+
 		if (rd_len) {
 			suffix = " rd=md0 -s";
 		} else if (init_arg) {

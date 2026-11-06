@@ -316,3 +316,27 @@ int gh_adt_get_property(const u8 *dt, u64 size, const char *path,
 		return -1;
 	return adt_get_prop(dt, size, node, name, value, len);
 }
+
+/*
+ * How many children the node at `path` has, or -1 when the tree or the path
+ * does not parse.
+ *
+ * This is how the loader derives the machine's CPU count for the kernel
+ * command line: the device tree is the one place the count is chosen, so
+ * Gatehouse reads /cpus instead of carrying a second, compiled-in number that
+ * could drift from it.  XNU's ml_parse_cpu_topology() takes the first N
+ * /cpus children for `cpus=N`, so the two are the same number by construction.
+ */
+int gh_adt_count_children(const u8 *dt, u64 size, const char *path)
+{
+	u64 node;
+
+	if (!dt || !path || size == 0)
+		return -1;
+	if (adt_node_end(dt, size, 0, 0) != size)
+		return -1;
+	node = adt_find_path(dt, size, path);
+	if (!node)
+		return -1;
+	return (int)adt_rd32(dt + node + 4);
+}

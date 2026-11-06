@@ -24,10 +24,11 @@
  *
  * Granule: 4 KiB.  With T0SZ=25 the walk starts at level 1 and covers a
  * 39-bit IPA (512 GiB), which is every machine this loader targets.  Whole
- * 1 GiB blocks use block descriptors; a block that only partly covers RAM
- * gets an L2 table of 2 MiB blocks, and the two partial 2 MiB chunks at the
- * edges get L3 tables.  The Lantern 2 MiB chunk always gets an L3 table so
- * exactly the two windows are absent.
+ * 1 GiB blocks use block descriptors; a block that only partly covers RAM,
+ * or that holds a Lantern window, gets an L2 table of 2 MiB blocks, and the
+ * 2 MiB chunks that hold a window or a RAM edge get L3 tables.  The window
+ * addresses come from the ADT (lantern.c), so a different machine description
+ * moves the holes without touching this file.
  */
 #include "gh.h"
 
@@ -98,12 +99,24 @@ static int s2_in_ram(u64 pa, u64 base, u64 top)
 	return pa >= base && pa < top;
 }
 
+/* Does [lo, hi) touch either Lantern window? */
+static int s2_lantern_hit(u64 lo, u64 hi)
+{
+	u32 w;
+
+	for (w = 0; w < 2; w++) {
+		u64 base = gh_lantern_window_base(w);
+		u64 end = base + gh_lantern_window_size(w);
+
+		if (base && lo < end && hi > base)
+			return 1;
+	}
+	return 0;
+}
+
 static int s2_is_lantern(u64 pa)
 {
-	return (pa >= GH_LANTERN_GFX_BASE &&
-		pa < GH_LANTERN_GFX_BASE + GH_LANTERN_WINDOW_SIZE) ||
-	       (pa >= GH_LANTERN_IOSFC_BASE &&
-		pa < GH_LANTERN_IOSFC_BASE + GH_LANTERN_WINDOW_SIZE);
+	return s2_lantern_hit(pa, pa + 1);
 }
 
 /* Fill one 2 MiB chunk with 4 KiB pages: RAM is Normal, the Lantern windows
@@ -135,9 +148,7 @@ static void s2_build_l2(u64 *l2, u64 blk, u64 base, u64 top, u64 dev,
 		u64 chunk = blk + (u64)i * S2_BLOCK_2M;
 		u64 end = chunk + S2_BLOCK_2M;
 
-		if (s2_is_lantern(chunk) || s2_is_lantern(end - 1) ||
-		    (chunk <= GH_LANTERN_GFX_BASE &&
-		     end > GH_LANTERN_GFX_BASE)) {
+		if (s2_lantern_hit(chunk, end)) {
 			u64 *l3 = s2_alloc_l3();
 
 			if (!l3) {
@@ -167,7 +178,6 @@ static void s2_build_l2(u64 *l2, u64 blk, u64 base, u64 top, u64 dev,
 
 void gh_stage2_init(void)
 {
-	const u64 lantern2m = GH_LANTERN_GFX_BASE & ~(S2_BLOCK_2M - 1);
 	const u64 dev = S2_AF | S2_AP_RW | S2_MEMATTR(S2_MEMATTR_DEVICE);
 	const u64 ram = S2_AF | S2_AP_RW | S2_SH_INNER |
 			S2_MEMATTR(S2_MEMATTR_NORMAL);
@@ -192,21 +202,12 @@ void gh_stage2_init(void)
 	for (i = 0; i < S2_ENTRIES; i++)
 		s2_l1[i] = s2_block(i * S2_BLOCK_1G, dev);
 
-	/* The Lantern chunk, first: its 2 MiB block always needs pages. */
-	{
-		u64 blk = lantern2m & ~(S2_BLOCK_1G - 1);
-		u64 *l2 = s2_alloc_l2();
-
-		if (!l2) {
-			gh_log("stage 2: out of L2 tables for Lantern\n");
-		} else {
-			s2_build_l2(l2, blk, base, top, dev, ram);
-			s2_l1[(blk >> 30) & 0x1ff] = (u64)l2 | S2_DESC_TABLE;
-		}
-	}
-
-	/* RAM: whole 1 GiB blocks stay blocks; the two edge blocks get 2 MiB
-	 * tables so only real memory is Normal. */
+	/*
+	 * Whole 1 GiB blocks of RAM stay 1 GiB descriptors.  A block that only
+	 * partly covers RAM, or that contains a Lantern window, gets a 2 MiB
+	 * table so exactly the window bytes are absent and only real memory is
+	 * Normal.  Every other block stays the Device block set above.
+	 */
 	if (base < top) {
 		u64 first = base / S2_BLOCK_1G;
 		u64 last = (top - 1) / S2_BLOCK_1G;
@@ -214,9 +215,8 @@ void gh_stage2_init(void)
 		for (i = first; i <= last; i++) {
 			u64 blk = i * S2_BLOCK_1G;
 
-			if (blk == (lantern2m & ~(S2_BLOCK_1G - 1)))
-				continue;	/* already page-mapped */
-			if (base <= blk && blk + S2_BLOCK_1G <= top) {
+			if (base <= blk && blk + S2_BLOCK_1G <= top &&
+			    !s2_lantern_hit(blk, blk + S2_BLOCK_1G)) {
 				s2_l1[i] = s2_block(blk, ram);
 			} else {
 				u64 *l2 = s2_alloc_l2();
@@ -229,6 +229,25 @@ void gh_stage2_init(void)
 				s2_l1[i] = (u64)l2 | S2_DESC_TABLE;
 			}
 		}
+	}
+
+	/* Windows outside the RAM range still need their own block table; the
+	 * lanes above only visit RAM blocks. */
+	for (i = 0; i < S2_ENTRIES; i++) {
+		u64 blk = i * S2_BLOCK_1G;
+		u64 *l2;
+
+		if (!s2_lantern_hit(blk, blk + S2_BLOCK_1G))
+			continue;
+		if ((s2_l1[i] & 3u) == S2_DESC_TABLE)
+			continue;
+		l2 = s2_alloc_l2();
+		if (!l2) {
+			gh_log("stage 2: out of L2 tables for Lantern\n");
+			continue;
+		}
+		s2_build_l2(l2, blk, base, top, dev, ram);
+		s2_l1[i] = (u64)l2 | S2_DESC_TABLE;
 	}
 
 	/*
@@ -268,5 +287,6 @@ void gh_stage2_init(void)
 	gh_loghex("stage 2 vtcr    : ", vtcr);
 	gh_loghex("stage 2 ram     : ", base);
 	gh_loghex("stage 2 ram top : ", top);
-	gh_loghex("stage 2 windows : ", GH_LANTERN_GFX_BASE);
+	gh_loghex("stage 2 window  : ", gh_lantern_window_base(GH_LANTERN_GFX));
+	gh_loghex("stage 2 window  : ", gh_lantern_window_base(GH_LANTERN_IOSFC));
 }

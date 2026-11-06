@@ -127,6 +127,7 @@ gh_jump_to_kernel:
 	mov	x7, #3
 	lsl	x7, x7, #40		/* HCR_EL2.{APK,API}: allow PAC at EL1 */
 	orr	x6, x6, x7
+	orr	x6, x6, #(1 << 13)	/* HCR_EL2.TWI: trap EL1 WFI to EL2 */
 	msr	hcr_el2, x6
 	isb				/* E2H change takes effect here */
 	msr	cptr_el2, xzr

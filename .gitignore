@@ -1,5 +1,7 @@
 # Build outputs
 /build/
+lantern/host/lantern-probe
+lantern/host/lantern-host
 *.o
 *.a
 *.EFI
@@ -24,3 +26,4 @@ __pycache__/
 
 # Go build output
 tools/mkcombined/mkcombined
+tools/mkisc/mkisc

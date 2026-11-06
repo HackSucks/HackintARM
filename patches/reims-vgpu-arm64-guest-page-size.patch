@@ -1,0 +1,377 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index c82d6926..06e8119d 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -301,6 +301,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+ [[package]]
+ name = "metal2vulkan"
+ version = "0.2.0"
++source = "git+https://github.com/steelbrain/metal2vulkan?rev=219f01365dc4c8eb346816c405b5b17403793764#219f01365dc4c8eb346816c405b5b17403793764"
+ dependencies = [
+  "ash",
+  "metal2vulkan-air",
+@@ -311,6 +312,7 @@ dependencies = [
+ [[package]]
+ name = "metal2vulkan-air"
+ version = "0.2.0"
++source = "git+https://github.com/steelbrain/metal2vulkan?rev=219f01365dc4c8eb346816c405b5b17403793764#219f01365dc4c8eb346816c405b5b17403793764"
+ dependencies = [
+  "sha2 0.11.1",
+ ]
+@@ -318,6 +320,7 @@ dependencies = [
+ [[package]]
+ name = "metal2vulkan-runtime"
+ version = "0.2.0"
++source = "git+https://github.com/steelbrain/metal2vulkan?rev=219f01365dc4c8eb346816c405b5b17403793764#219f01365dc4c8eb346816c405b5b17403793764"
+ dependencies = [
+  "ash",
+  "libc",
+diff --git a/crates/reims-vgpu-core/Cargo.toml b/crates/reims-vgpu-core/Cargo.toml
+index d726c943..fa6ead24 100644
+--- a/crates/reims-vgpu-core/Cargo.toml
++++ b/crates/reims-vgpu-core/Cargo.toml
+@@ -10,6 +10,8 @@ license.workspace = true
+ [features]
+ # core::testkit and testkit::capture outside this crate's own unit tests (architecture 13.2).
+ testkit = []
++# The guest uses ARM64's 16 KiB pages even when this library is built for an x86-64 host.
++arm64-guest = []
+ 
+ # Architecture 2.2: no objc2, block2, dispatch2, mach2 or libc here.
+ [dependencies]
+diff --git a/crates/reims-vgpu-core/src/device/tasks.rs b/crates/reims-vgpu-core/src/device/tasks.rs
+index e7adfcfa..19a105c4 100644
+--- a/crates/reims-vgpu-core/src/device/tasks.rs
++++ b/crates/reims-vgpu-core/src/device/tasks.rs
+@@ -69,8 +69,21 @@ impl Isolation {
+ /// The task table's size: task ids are below 256.
+ pub const MAX_TASKS: u32 = 256;
+ 
+-/// The largest local task (32 GiB).
+-pub const MAX_LOCAL_TASK_LENGTH: u64 = 0x8_0000_0000;
++/// The largest local task's *length*: how much virtual address space the guest may give it.
++/// Apple's x86-64 GPU driver asks for 32 GiB; its arm64 driver asks for 256 GiB, which is
++/// exactly two levels of the guest's 16 KiB page tables (see
++/// `crate::tasks::local::page_table_coverage`). This is a length the task records and its
++/// ranges are checked against, not an allocation.
++pub const MAX_LOCAL_TASK_LENGTH: u64 = if cfg!(feature = "arm64-guest") {
++    0x40_0000_0000
++} else {
++    0x8_0000_0000
++};
++
++/// The largest buffer the host copies out of a task at once (32 GiB). A command's payloads
++/// and a task's reads are far smaller; this is only the guard against a guest asking the host
++/// to allocate an absurd buffer.
++pub const MAX_TASK_BUFFER_LENGTH: u64 = 0x8_0000_0000;
+ 
+ /// A task's root word written through a missing root node (never reached: the root node is
+ /// checked first).
+diff --git a/crates/reims-vgpu-core/src/display/gamma.rs b/crates/reims-vgpu-core/src/display/gamma.rs
+index 5a2fd202..8a53dbc3 100644
+--- a/crates/reims-vgpu-core/src/display/gamma.rs
++++ b/crates/reims-vgpu-core/src/display/gamma.rs
+@@ -2,7 +2,7 @@
+ //! guest's sum, uploaded into a 1D-array texture of three slices, and its end slopes into the
+ //! fragment properties.
+ 
+-use crate::device::tasks::MAX_LOCAL_TASK_LENGTH;
++use crate::device::tasks::MAX_TASK_BUFFER_LENGTH;
+ use crate::display::{DeathKind, DisplayCore, DisplayLocked, RaiseKind};
+ use crate::num::ToUsize;
+ use crate::platform::Platform;
+@@ -99,7 +99,7 @@ impl<P: Platform> DisplayCore<P> {
+         // A mapped length past the largest local task faults here, before any buffer is made: no
+         // task holds such a range, so the copy would fault it anyway
+         // (`tests::update_gamma_table::gamma_mapped_length_past_any_task_faults`).
+-        if gamma.mapped_length > MAX_LOCAL_TASK_LENGTH {
++        if gamma.mapped_length > MAX_TASK_BUFFER_LENGTH {
+             crate::raise!(
+                 RaiseKind::GammaLength,
+                 format_args!(
+diff --git a/crates/reims-vgpu-core/src/display/guest_display/cursor.rs b/crates/reims-vgpu-core/src/display/guest_display/cursor.rs
+index 240d4d89..89fa0673 100644
+--- a/crates/reims-vgpu-core/src/display/guest_display/cursor.rs
++++ b/crates/reims-vgpu-core/src/display/guest_display/cursor.rs
+@@ -8,7 +8,7 @@ use std::sync::Arc;
+ use std::sync::atomic::Ordering;
+ 
+ use super::{DeathKind, GuestDisplay, GuestDisplayLocked, RaiseKind};
+-use crate::device::tasks::MAX_LOCAL_TASK_LENGTH;
++use crate::device::tasks::MAX_TASK_BUFFER_LENGTH;
+ use crate::display::host_calls::CursorGlyph;
+ use crate::display::page as sp;
+ use crate::display::{DisplayCoord, DisplayCore};
+@@ -63,7 +63,7 @@ impl<P: Platform> GuestDisplay<P> {
+         // A mapped length past the largest local task faults here, before any block is made: no
+         // task holds such a range, so the copy would fault it anyway
+         // (`tests::cursor_glyph::glyph_mapped_length_past_any_task_faults`).
+-        if args.mapped_length > MAX_LOCAL_TASK_LENGTH {
++        if args.mapped_length > MAX_TASK_BUFFER_LENGTH {
+             crate::raise!(
+                 RaiseKind::CursorBuffer,
+                 format_args!(
+diff --git a/crates/reims-vgpu-core/src/display/guest_display/tests.rs b/crates/reims-vgpu-core/src/display/guest_display/tests.rs
+index e602e806..fcc6897f 100644
+--- a/crates/reims-vgpu-core/src/display/guest_display/tests.rs
++++ b/crates/reims-vgpu-core/src/display/guest_display/tests.rs
+@@ -1328,11 +1328,11 @@ mod cursor_glyph {
+     /// is asked, with a task or without
+     #[test]
+     fn glyph_mapped_length_past_any_task_faults() {
+-        use crate::device::tasks::MAX_LOCAL_TASK_LENGTH;
++        use crate::device::tasks::MAX_TASK_BUFFER_LENGTH;
+         let fx = Fx::new();
+         let hold = Hold::NONE;
+         let mut buffer = [0u32; 1];
+-        for len in [MAX_LOCAL_TASK_LENGTH + 1, 1 << 62, u64::MAX] {
++        for len in [MAX_TASK_BUFFER_LENGTH + 1, 1 << 62, u64::MAX] {
+             let e = fx
+                 .guest_display
+                 .copy_guest_glyph(hold, None, args(1, 1, 4, len, 0), &mut buffer)
+diff --git a/crates/reims-vgpu-core/src/guest/records.rs b/crates/reims-vgpu-core/src/guest/records.rs
+index 9b6d04fa..73a05287 100644
+--- a/crates/reims-vgpu-core/src/guest/records.rs
++++ b/crates/reims-vgpu-core/src/guest/records.rs
+@@ -16,13 +16,18 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+ 
+ use crate::num::Truncate;
+ 
+-/// The guest page shift: 14 for an arm64 guest's 16 KiB pages, 12 for an x86-64 guest's 4 KiB
+-/// ones, the build's architecture's. QEMU offers the device only to guests of its host's own
+-/// architecture, those HVF or KVM runs there, so the guest's is the build's: an arm64 build
+-/// serves arm64 guests, an x86-64 build x86-64 ones (core's tests also run as x86-64 under
+-/// Rosetta on a Mac). Every page number the guest hands the device counts these pages. Name is
+-/// ours: the shift of `APV_PAGE_SIZE`.
+-pub const APV_PAGE_SHIFT: u32 = if cfg!(target_arch = "x86_64") { 12 } else { 14 };
++/// The guest page shift: ARM64 guests use 16 KiB pages; x86-64 guests use 4 KiB pages. By
++/// default the build's architecture selects it, because ordinary QEMU hosts use virtualization
++/// for guests of their own architecture. A host serving an ARM64 guest through cross-architecture
++/// emulation enables the `arm64-guest` feature. Every page number the guest hands the device
++/// counts these pages. Name is ours: the shift of `APV_PAGE_SIZE`.
++pub const APV_PAGE_SHIFT: u32 = if cfg!(feature = "arm64-guest") {
++    14
++} else if cfg!(target_arch = "x86_64") {
++    12
++} else {
++    14
++};
+ 
+ /// `APV_PAGE_SIZE`: the guest page size, 16 KiB (4 KiB on x86-64).
+ pub const APV_PAGE_SIZE: u64 = 1_u64.wrapping_shl(APV_PAGE_SHIFT);
+diff --git a/crates/reims-vgpu-core/src/iosurface/descriptor.rs b/crates/reims-vgpu-core/src/iosurface/descriptor.rs
+index 122b9d1c..e14b48a9 100644
+--- a/crates/reims-vgpu-core/src/iosurface/descriptor.rs
++++ b/crates/reims-vgpu-core/src/iosurface/descriptor.rs
+@@ -9,6 +9,7 @@ use std::num::NonZeroU64;
+ 
+ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+ 
++use crate::guest::records::APV_PAGE_SIZE;
+ use crate::host::{PhysicalMemoryRange, RaiseInterrupt};
+ use crate::iosurface::table::SurfaceSlot;
+ use crate::memory::descriptor::MemoryMapDescriptor;
+@@ -447,7 +448,6 @@ pub(super) fn plane_specs(
+ /// lists each of its pages as a client address range; a host-only one lists none. The
+ /// surface-level compression type goes under the plane key, as the device has always sent it.
+ pub(super) fn surface_spec<P: Platform>(
+-    p: &P,
+     descriptor: &IoSurfaceDeviceDescriptor2,
+     slot: &mut SurfaceSlot<P>,
+ ) -> Option<SurfaceSpec> {
+@@ -498,7 +498,7 @@ pub(super) fn surface_spec<P: Platform>(
+         log::debug!("the surface is host-only");
+         return Some(spec);
+     }
+-    let page = p.vm().page_size();
++    let page = APV_PAGE_SIZE;
+     spec.client_address_ranges = Some(
+         slot.pages
+             .iter()
+diff --git a/crates/reims-vgpu-core/src/iosurface/device.rs b/crates/reims-vgpu-core/src/iosurface/device.rs
+index 98fdd2dc..c0a99276 100644
+--- a/crates/reims-vgpu-core/src/iosurface/device.rs
++++ b/crates/reims-vgpu-core/src/iosurface/device.rs
+@@ -29,6 +29,7 @@ use std::sync::{Arc, Weak};
+ use parking_lot::Mutex;
+ 
+ use crate::guest::GuestPtr;
++use crate::guest::records::{APV_PAGE_SHIFT, APV_PAGE_SIZE};
+ use crate::host::{HostPtr, RaiseInterrupt};
+ use crate::iosurface::DeathKind;
+ use crate::iosurface::descriptor::{Form, IoSurfaceHostDeviceDescriptor};
+@@ -273,7 +274,7 @@ impl<P: Platform> IoSurfaceHostDevice<P> {
+         platform: &Arc<P>,
+         descriptor: &IoSurfaceHostDeviceDescriptor,
+     ) -> Result<HostDeviceHandle<P>, IoSurfaceRefusal> {
+-        let page = platform.vm().page_size();
++        let page = APV_PAGE_SIZE;
+         let table_len = page / const { NonZeroU64::new(TABLE_ENTRY_SIZE).unwrap() };
+         let descriptors_per_page = page / Form::First.size();
+         let mmio_length = descriptor.mmio_length;
+@@ -376,14 +377,16 @@ impl<P: Platform> HostDeviceCore<P> {
+             })
+     }
+ 
+-    /// The VM page size.
++    /// The guest ABI page size: every page number the guest hands this device counts these
++    /// pages, which are the guest's, not the host VM's. An ARM64 guest on an x86-64 host uses
++    /// 16 KiB pages against a 4 KiB host VM, so the two must not be conflated.
+     pub(super) fn page_size(&self) -> u64 {
+-        self.platform.vm().page_size()
++        APV_PAGE_SIZE
+     }
+ 
+-    /// The VM page shift.
++    /// The guest ABI page shift, the shift of [`Self::page_size`].
+     pub(super) fn page_shift(&self) -> u32 {
+-        self.platform.vm().page_shift()
++        APV_PAGE_SHIFT
+     }
+ 
+     /// Another reference to the IOSurface mapped at `mapping_id`, made on the device's queue;
+diff --git a/crates/reims-vgpu-core/src/iosurface/table.rs b/crates/reims-vgpu-core/src/iosurface/table.rs
+index 49c9aa56..487b092a 100644
+--- a/crates/reims-vgpu-core/src/iosurface/table.rs
++++ b/crates/reims-vgpu-core/src/iosurface/table.rs
+@@ -251,7 +251,7 @@ impl<P: Platform> HostDeviceCore<P> {
+             return status;
+         }
+         // The cause of a refusal has its own line.
+-        let Some(spec) = surface_spec(&*self.platform, descriptor, slot) else {
++        let Some(spec) = surface_spec(descriptor, slot) else {
+             log::debug!("map: surface {mapping_id}'s properties were refused");
+             return IoReturn::NoMemory;
+         };
+diff --git a/crates/reims-vgpu-core/src/memory/map.rs b/crates/reims-vgpu-core/src/memory/map.rs
+index a5c703be..6b4ce23e 100644
+--- a/crates/reims-vgpu-core/src/memory/map.rs
++++ b/crates/reims-vgpu-core/src/memory/map.rs
+@@ -4,6 +4,7 @@
+ use std::num::NonZeroU64;
+ use std::sync::Arc;
+ 
++#[cfg(test)]
+ use crate::guest::records::APV_PAGE_SIZE;
+ use crate::host::{HostPtr, PhysRange};
+ use crate::memory::DeathKind;
+@@ -305,7 +306,7 @@ impl<P: Platform> MemoryMap<P> {
+ 
+     /// A fresh VM allocation with each request range remapped into it, in request order; every
+     /// refusal after the allocation deallocates it, except a failed protect. A length that is not
+-    /// whole pages dies.
++    /// whole host VM pages dies.
+     pub fn new_range_mapping(
+         &self,
+         ranges: &[PhysRange],
+@@ -313,9 +314,11 @@ impl<P: Platform> MemoryMap<P> {
+         read_only: u32,
+     ) -> Option<Arc<Mapping<P>>> {
+         let vm = self.platform.vm();
+-        // A total length of 0 passes the assert.
++        // The mapping's byte length must satisfy the host VM's granularity. Guest ABI pages can
++        // be larger than host VM pages (an ARM64 guest on an x86-64 Linux host, for example).
+         crate::fatal_unless!(
+-            total_length % const { NonZeroU64::new(APV_PAGE_SIZE).unwrap() } == 0,
++            NonZeroU64::new(vm.page_size())
++                .is_some_and(|page| total_length.is_multiple_of(page.get())),
+             DeathKind::MappingLengthUnaligned
+         );
+         let Ok(address) = vm.allocate_anywhere(total_length) else {
+diff --git a/crates/reims-vgpu-core/src/tasks/local/memory.rs b/crates/reims-vgpu-core/src/tasks/local/memory.rs
+index bfaf1be1..369ea365 100644
+--- a/crates/reims-vgpu-core/src/tasks/local/memory.rs
++++ b/crates/reims-vgpu-core/src/tasks/local/memory.rs
+@@ -7,7 +7,7 @@ use super::{
+     Backend, LocalTask, PAGE, PAGE_MASK, RaiseKind, page_address, raise_carrying, raise_caught,
+     raise_on,
+ };
+-use crate::device::tasks::MAX_LOCAL_TASK_LENGTH;
++use crate::device::tasks::MAX_TASK_BUFFER_LENGTH;
+ use crate::host::{HostPtr, PhysRange};
+ use crate::memory::cursor::Cursor;
+ use crate::memory::mapping::Mapping;
+@@ -481,11 +481,11 @@ impl<P: Platform> LocalTask<P> {
+     }
+ 
+     /// A read-only snapshot of task memory at `offset`, copied now; `None` where the copy
+-    /// refuses or raises (no log), or where the length is past the largest task (32 GiB, a log),
++    /// refuses or raises (no log), or where the length is past the largest buffer (32 GiB, a log),
+     /// as it was where the host could not allocate the buffer. The buffer is made only once the
+     /// range check passes, so a range the copy refuses touches no memory.
+     pub(super) fn cursor(&self, hold: Hold<'_>, offset: u64, length: u64) -> Option<Cursor> {
+-        if length > MAX_LOCAL_TASK_LENGTH {
++        if length > MAX_TASK_BUFFER_LENGTH {
+             log::warn!(
+                 "task {}: no cursor of {length:#x} bytes, longer than any task",
+                 self.task_id
+diff --git a/crates/reims-vgpu-core/src/tasks/shared.rs b/crates/reims-vgpu-core/src/tasks/shared.rs
+index e210582c..06fddabb 100644
+--- a/crates/reims-vgpu-core/src/tasks/shared.rs
++++ b/crates/reims-vgpu-core/src/tasks/shared.rs
+@@ -17,7 +17,7 @@ use std::sync::{Arc, Weak};
+ use parking_lot::{Mutex, ReentrantMutex};
+ 
+ use crate::deserializer::Deserializer;
+-use crate::device::tasks::MAX_LOCAL_TASK_LENGTH;
++use crate::device::tasks::MAX_TASK_BUFFER_LENGTH;
+ use crate::fatal;
+ use crate::fifo::wire::Records;
+ use crate::guest::records::ObjectEntry;
+@@ -559,7 +559,7 @@ impl<P: Platform> TaskCore<P> {
+ 
+     /// A fresh buffer of `length` bytes that `copy` (the kind's copy from task memory) fills.
+     ///
+-    /// A length past the largest task (32 GiB) raises before anything is allocated: no local
++    /// A length past the largest buffer (32 GiB) raises before anything is allocated: no local
+     /// task holds such a range, so the copy would raise anyway, and the guest sees the fault it
+     /// saw when the host could not allocate the buffer. The buffer is made zeroed (lazily mapped
+     /// for a large one), so a length the copy then refuses touches no memory, and a raise in the
+@@ -573,7 +573,7 @@ impl<P: Platform> TaskCore<P> {
+         length: u64,
+         copy: impl FnOnce(u64, &mut [u8]) -> RaiseResult<()>,
+     ) -> RaiseResult<Option<Vec<u8>>> {
+-        if length > MAX_LOCAL_TASK_LENGTH {
++        if length > MAX_TASK_BUFFER_LENGTH {
+             return raise_on(
+                 on,
+                 RaiseKind::BufferLength,
+@@ -1785,7 +1785,7 @@ mod tests {
+         #[test]
+         fn a_length_past_any_task_raises() {
+             let t = tx();
+-            for length in [MAX_LOCAL_TASK_LENGTH + 1, u64::MAX] {
++            for length in [MAX_TASK_BUFFER_LENGTH + 1, u64::MAX] {
+                 let e = t
+                     .base
+                     .data_from_virtual_offset(OnFault::Return, 0, length, |_, _| panic!("no copy"))
+@@ -1795,8 +1795,8 @@ mod tests {
+             }
+             let e = t
+                 .base
+-                .data_from_virtual_offset(OnFault::Return, 0, MAX_LOCAL_TASK_LENGTH, |_, dst| {
+-                    assert_eq!(dst.len() as u64, MAX_LOCAL_TASK_LENGTH);
++                .data_from_virtual_offset(OnFault::Return, 0, MAX_TASK_BUFFER_LENGTH, |_, dst| {
++                    assert_eq!(dst.len() as u64, MAX_TASK_BUFFER_LENGTH);
+                     Err(crate::testkit::capture::raise(
+                         OnFault::Return,
+                         "test.copy",
+diff --git a/xtask/src/dist.rs b/xtask/src/dist.rs
+index 6919d0b1..0547145e 100644
+--- a/xtask/src/dist.rs
++++ b/xtask/src/dist.rs
+@@ -85,7 +85,13 @@ impl Platform {
+     pub fn features(self) -> &'static [&'static str] {
+         match self {
+             Platform::Metal => &[],
+-            Platform::Vulkan => &["--features", "reims-vgpu-c/vulkan"],
++            // An ARM64 guest uses 16 KiB pages even when this library is built for an
++            // x86-64 host, so the Vulkan distribution also selects the guest page-size
++            // feature.
++            Platform::Vulkan => &[
++                "--features",
++                "reims-vgpu-c/vulkan,reims-vgpu-core/arm64-guest",
++            ],
+         }
+     }
+ }

@@ -21,6 +21,9 @@ CFLAGS  := $(TARGETFLAGS) -ffreestanding -fno-stack-protector -fno-builtin \
            -fshort-wchar -mno-red-zone -mstrict-align -O2 -g -Wall -Wextra \
            -Wno-unused-parameter -Iinclude -ffunction-sections -fdata-sections \
            -march=armv8-a+pauth
+ifdef LANTERN
+CFLAGS += -DGH_LANTERN_HOST_TRANSPORT=1 -I../lantern/include
+endif
 
 ifdef STALL
 CFLAGS += -DGH_ATTACH_STALL_MS=$(STALL)
